@@ -89,10 +89,19 @@ def process_speech():
         prompt = f"""
         User said: "{user_input}"
         Context: "{call_context['issue']}"
+        
         INSTRUCTIONS:
-        1. If NO email: Ask for it.
-        2. If email given: Output ACTION_CREATE_TICKET: <email>
-        3. If done: Output TERMINATE
+        1. If the user has NOT provided an email yet, ask for it politely.
+        2. If the user provided an email, you MUST output the command: ACTION_CREATE_TICKET: <email>
+        
+        CRITICAL RULES FOR EMAIL TRANSCRIPTION:
+        - "at" -> "@"
+        - "dot" -> "."
+        - JOIN SPELLED LETTERS: If user spells "a k i f", output "akif".
+        - REMOVE SPACES: The final email must have NO spaces.
+        - Example: "j o h n at gmail dot com" -> "john@gmail.com"
+        
+        3. If the ticket is created, output: TERMINATE
         """
         response = model.generate_content(prompt)
         ai_reply = response.text.strip().replace("*", "")
