@@ -1,0 +1,13 @@
+# Secrets (Most Important)
+.env
+
+# Python Caches (Clutter)
+__pycache__/
+*.pyc
+
+# Mac System Files (Clutter)
+.DS_Store
+
+# Virtual Environments
+venv/
+env/

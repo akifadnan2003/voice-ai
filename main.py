@@ -19,13 +19,20 @@ if GEMINI_API_KEY:
 
 call_context = {"issue": ""}
 
+# Replace your existing create_zendesk_ticket function with this:
 def create_zendesk_ticket(user_email, issue_summary):
     if not all([ZD_EMAIL, ZD_SUBDOMAIN, ZD_TOKEN]):
+        print("❌ ERROR: Missing ZD_EMAIL, ZD_SUBDOMAIN, or ZD_TOKEN")
         return None
+    
     url = f"https://{ZD_SUBDOMAIN}.zendesk.com/api/v2/tickets.json"
     creds = f"{ZD_EMAIL}/token:{ZD_TOKEN}"
     encoded_creds = base64.b64encode(creds.encode()).decode()
+    
+    # Clean the email just in case
+    user_email = user_email.strip().replace("<", "").replace(">", "")
     user_name = user_email.split("@")[0]
+    
     payload = {
         "ticket": {
             "subject": f"Voice AI: {issue_summary[:30]}...",
@@ -33,14 +40,31 @@ def create_zendesk_ticket(user_email, issue_summary):
             "requester": { "name": user_name, "email": user_email }
         }
     }
-    headers = {"Content-Type": "application/json", "Authorization": f"Basic {encoded_creds}"}
+    
+    headers = {
+        "Content-Type": "application/json", 
+        "Authorization": f"Basic {encoded_creds}"
+    }
+    
     try:
+        print(f"🚀 Sending ticket to: {url}")
+        print(f"📧 With email: {user_email}")
+        
         response = requests.post(url, json=payload, headers=headers)
+        
+        # --- THE DEBUGGING LINES ---
+        print(f"📡 Zendesk Status Code: {response.status_code}")
+        print(f"📝 Zendesk Response: {response.text}")
+        # ---------------------------
+
         if response.status_code == 201:
             return response.json()['ticket']['id']
-    except:
+        else:
+            return None
+            
+    except Exception as e:
+        print(f"💥 CRITICAL EXCEPTION: {e}")
         return None
-    return None
 
 @app.route("/voice", methods=['GET', 'POST'])
 def voice():
