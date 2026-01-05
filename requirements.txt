@@ -1,5 +1,5 @@
 flask
-twilio
-google-generativeai
-requests
 gunicorn
+requests
+google-generativeai
+python-dotenv
