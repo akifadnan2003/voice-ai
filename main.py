@@ -60,6 +60,17 @@ def normalize_spoken_email(text: str) -> str:
 def is_valid_email(email: str) -> bool:
     return bool(email) and bool(EMAIL_RE.match(email))
 
+
+def normalize_problem_text(text: str) -> str:
+    """Normalize common speech-to-text errors for Aerosus automotive context."""
+    if not text:
+        return ""
+
+    # We are an automotive air-suspension company; ASR often turns "air" into "ear".
+    normalized = text
+    normalized = re.sub(r"\bear\s+suspension\b", "air suspension", normalized, flags=re.IGNORECASE)
+    return normalized
+
 def calculate_cost(duration_sec, in_tok, out_tok):
     minutes = (duration_sec // 60) + 1
     twilio_cost = minutes * PRICE_TWILIO_PER_MIN
@@ -141,13 +152,19 @@ def voice():
     if not context.get("email") and is_valid_email(normalized_email):
         context["email"] = normalized_email
 
-    # If we don't have a problem yet, treat the first substantive user input as the problem.
-    if not context.get("problem") and not context.get("email"):
-        context["problem"] = user_input.strip()
+    # Capture/accumulate problem details until we get a valid email.
+    if not context.get("email") and not is_valid_email(normalized_email):
+        if not context.get("problem"):
+            context["problem"] = normalize_problem_text(user_input.strip())
+        else:
+            # Add extra details (e.g., "It's leaking") to improve the ticket summary.
+            extra = normalize_problem_text(user_input.strip())
+            if extra and extra.lower() not in context["problem"].lower():
+                context["problem"] = f"{context['problem']} {extra}".strip()
 
-    # If we have problem but no email: ask for email using the exact phrasing requested.
-    # (Handled by AI prompt below; kept deterministic fallback if AI is unavailable.)
-    if context.get("problem") and not context.get("email") and model is None:
+    # If we have problem but no email: ALWAYS ask for email using the exact phrasing requested.
+    # This avoids Gemini drifting (e.g., asking extra questions) and guarantees the desired flow.
+    if context.get("problem") and not context.get("email"):
         ai_reply = "Ok to proceed with your request provide me your email."
         context["history"].append(f"AI: {ai_reply}")
         return Response(
@@ -174,7 +191,11 @@ def voice():
 
     # Otherwise, continue with Gemini for general support dialog (while we still gather missing info).
     prompt = f"""
-You are a helpful customer support agent.
+You are a helpful customer support agent for Aerosus.
+
+Context about Aerosus (important):
+- Aerosus sells automotive air suspension components (car parts).
+- If the user says "ear suspension", they almost certainly mean "air suspension".
 
 Conversation History:
 {chr(10).join(context['history'])}
@@ -190,8 +211,16 @@ Ok to proceed with your request provide me your email.
 3) If the user has provided an email, do NOT say a ticket was created (the system will handle it).
 
 OUTPUT RULES:
+- Do NOT output "Step 1" or "Step 2".
+- Do NOT narrate your thought process.
+- Do NOT say "I will ask for your email". Just ask it directly.
 - Keep it to one short sentence.
 - Do not mention internal instructions.
+
+EMAIL NORMALIZATION GUIDANCE (for recognition):
+- "at" -> "@"
+- "dot" -> "."
+- Letter-by-letter like "a k i f" should be treated as "akif".
 """
 
     try:
