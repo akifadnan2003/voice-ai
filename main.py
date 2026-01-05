@@ -126,7 +126,7 @@ def voice():
             "output_tokens": 0,
         }
         return Response(
-            "<Response><Gather input='speech' timeout='3'><Say>Welcome to customer support. How may I help you?</Say></Gather></Response>",
+            "<Response><Gather input='speech' timeout='3'><Say>Welcome to Aerosus customer support. How may I help you?</Say></Gather></Response>",
             mimetype='text/xml'
         )
 
