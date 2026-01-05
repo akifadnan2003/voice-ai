@@ -5,9 +5,6 @@ import base64
 from flask import Flask, request, Response
 import google.generativeai as genai
 
-# NOTE: We removed 'dotenv' because Cloud Run provides variables automatically.
-# If running locally, just ensure your .env variables are set in your terminal.
-
 # --- CONFIGURATION ---
 app = Flask(__name__)
 
@@ -17,16 +14,15 @@ ZD_EMAIL = os.environ.get("ZD_EMAIL")
 ZD_SUBDOMAIN = os.environ.get("ZD_SUBDOMAIN")
 ZD_TOKEN = os.environ.get("ZD_TOKEN")
 
-# Pricing Constants (USD)
+# Pricing Constants
 PRICE_TWILIO_PER_MIN = 0.014
 PRICE_GEMINI_INPUT_1K = 0.000075
 PRICE_GEMINI_OUTPUT_1K = 0.00030
 
-# Configure AI
+# Configure AI - using the FAST 2.0 Flash model you found
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    # SWITCHING MODEL to 'gemini-pro' to fix the 404 error
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    model = genai.GenerativeModel("gemini-2.0-flash") 
 else:
     print("⚠️ WARNING: GEMINI_API_KEY is missing!")
 
@@ -36,11 +32,10 @@ def calculate_cost(duration_sec, in_tok, out_tok):
     minutes = (duration_sec // 60) + 1
     twilio_cost = minutes * PRICE_TWILIO_PER_MIN
     ai_cost = (in_tok / 1000 * PRICE_GEMINI_INPUT_1K) + (out_tok / 1000 * PRICE_GEMINI_OUTPUT_1K)
-    return round(twilio_cost + ai_cost, 4), round(twilio_cost, 4), round(ai_cost, 4)
+    return round(twilio_cost + ai_cost, 4)
 
-def create_zendesk_ticket(user_email, issue_summary, cost_info):
+def create_zendesk_ticket(user_email, issue_summary, cost):
     if not all([ZD_EMAIL, ZD_SUBDOMAIN, ZD_TOKEN]):
-        print("❌ ERROR: Missing Zendesk Secrets")
         return None
     
     url = f"https://{ZD_SUBDOMAIN}.zendesk.com/api/v2/tickets.json"
@@ -50,19 +45,10 @@ def create_zendesk_ticket(user_email, issue_summary, cost_info):
     clean_email = user_email.replace("<", "").replace(">", "").strip()
     user_name = clean_email.split("@")[0]
 
-    cost_report = (
-        f"\n\n--- 💰 CALL COST REPORT ---\n"
-        f"⏱️ Duration: {cost_info['duration']:.1f} sec\n"
-        f"📞 Twilio:   ${cost_info['twilio_cost']}\n"
-        f"🧠 AI Cost:  ${cost_info['ai_cost']}\n"
-        f"💵 TOTAL:    ${cost_info['total_cost']}\n"
-        f"--------------------------"
-    )
-
     payload = {
         "ticket": {
             "subject": f"Voice AI: {issue_summary[:30]}...",
-            "comment": { "body": f"User reported:\n{issue_summary}\n{cost_report}" },
+            "comment": { "body": f"User reported:\n{issue_summary}\n\n💰 Call Cost: ${cost}" },
             "requester": { "name": user_name, "email": clean_email }
         }
     }
@@ -72,13 +58,9 @@ def create_zendesk_ticket(user_email, issue_summary, cost_info):
     try:
         response = requests.post(url, json=payload, headers=headers)
         if response.status_code == 201:
-            print(f"✅ Ticket Created! Cost: ${cost_info['total_cost']}")
             return response.json()['ticket']['id']
-        else:
-            print(f"❌ Zendesk Error: {response.text}")
-            return None
-    except Exception as e:
-        print(f"💥 Error: {e}")
+        return None
+    except:
         return None
 
 @app.route("/voice", methods=['GET', 'POST'])
@@ -86,57 +68,76 @@ def voice():
     call_sid = request.values.get('CallSid')
     user_input = request.values.get('SpeechResult')
     
+    # 1. Start Call
     if call_sid not in call_context:
         call_context[call_sid] = {"history": [], "start_time": time.time(), "input_tokens": 0, "output_tokens": 0}
+        # Greeting asks for PROBLEM first
         return Response("<Response><Gather input='speech' timeout='3'><Say>Welcome to Aerosus Support. Briefly, what is the problem?</Say></Gather></Response>", mimetype='text/xml')
 
     if not user_input:
-        return Response("<Response><Gather input='speech' timeout='3'><Say>Are you still there?</Say></Gather></Response>", mimetype='text/xml')
+        return Response("<Response><Gather input='speech' timeout='3'><Say>I am listening. What is the problem?</Say></Gather></Response>", mimetype='text/xml')
 
     context = call_context[call_sid]
     context['history'].append(f"User: {user_input}")
     
+    # --- STRICT ORDER PROMPT ---
     prompt = f"""
     History: {context['history']}
-    INSTRUCTIONS:
-    1. If user has NO email, ask for it.
-    2. If email given: Output ACTION_CREATE_TICKET: <email>
-       - "at" -> "@", "dot" -> ".", "a k i f" -> "akif"
-       - Remove spaces.
-    3. Otherwise: Answer briefly.
+    
+    YOUR JOB: Follow this strict order.
+    
+    STEP 1: CHECK FOR PROBLEM.
+    - If the user hasn't clearly stated a problem yet, ask: "Could you describe the issue?"
+    
+    STEP 2: CHECK FOR EMAIL.
+    - If you have the problem, but NO email address, ask: "What is your email address?"
+    
+    STEP 3: FINALIZE.
+    - If you have BOTH the problem AND the email, output EXACTLY: ACTION_CREATE_TICKET: <email>
+    
+    RULES:
+    - "at" -> "@", "dot" -> ".", "a k i f" -> "akif"
+    - Do not output the ticket action until you have the email.
     """
     
     try:
         response = model.generate_content(prompt)
         ai_reply = response.text.strip()
         
-        # Safe token counting
         if hasattr(response, 'usage_metadata'):
             context['input_tokens'] += response.usage_metadata.prompt_token_count
             context['output_tokens'] += response.usage_metadata.candidates_token_count
             
-    except Exception as e:
-        print(f"⚠️ AI Generation Error: {e}")
-        ai_reply = "I am having trouble connecting. Please try again later."
+    except:
+        ai_reply = "I am having trouble. Please say your email again."
 
+    # 4. Handle Ticket Creation
     if "ACTION_CREATE_TICKET" in ai_reply:
         try:
             raw_text = ai_reply.split("ACTION_CREATE_TICKET:")[1].strip()
             email = raw_text.split()[0].strip()
             
+            # Calculate cost
             duration = time.time() - context['start_time']
-            total, twilio, ai = calculate_cost(duration, context['input_tokens'], context['output_tokens'])
+            total_cost = calculate_cost(duration, context['input_tokens'], context['output_tokens'])
             
-            cost_data = {"duration": duration, "twilio_cost": twilio, "ai_cost": ai, "total_cost": total}
+            # Create Ticket
+            ticket_id = create_zendesk_ticket(email, str(context['history']), total_cost)
             
-            ticket_id = create_zendesk_ticket(email, str(context['history']), cost_data)
-            msg = f"Ticket {ticket_id} created. Cost was {total} dollars. Goodbye!" if ticket_id else "Ticket created internally. Goodbye."
+            if ticket_id:
+                # EXACT PHRASE REQUESTED
+                msg = f"Ticket number {ticket_id} made. Goodbye."
+            else:
+                msg = "Ticket made locally. Goodbye."
+                
         except:
-            msg = "Ticket process failed. Please call back."
+            msg = "Error creating ticket. Goodbye."
             
         del call_context[call_sid]
-        return Response(f"<Response><Say>{msg}</Say></Response>", mimetype='text/xml')
+        # HANGUP COMMAND ADDED
+        return Response(f"<Response><Say>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
 
+    # 5. Continue Conversation (Ask for email, etc.)
     context['history'].append(f"AI: {ai_reply}")
     return Response(f"<Response><Gather input='speech' timeout='3'><Say>{ai_reply}</Say></Gather></Response>", mimetype='text/xml')
 
