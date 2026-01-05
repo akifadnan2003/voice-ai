@@ -14,12 +14,12 @@ ZD_EMAIL = os.environ.get("ZD_EMAIL")
 ZD_SUBDOMAIN = os.environ.get("ZD_SUBDOMAIN")
 ZD_TOKEN = os.environ.get("ZD_TOKEN")
 
-# Pricing Constants
+# Pricing
 PRICE_TWILIO_PER_MIN = 0.014
 PRICE_GEMINI_INPUT_1K = 0.000075
 PRICE_GEMINI_OUTPUT_1K = 0.00030
 
-# Configure AI - using the FAST 2.0 Flash model you found
+# Configure AI
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel("gemini-2.0-flash") 
@@ -71,7 +71,6 @@ def voice():
     # 1. Start Call
     if call_sid not in call_context:
         call_context[call_sid] = {"history": [], "start_time": time.time(), "input_tokens": 0, "output_tokens": 0}
-        # Greeting asks for PROBLEM first
         return Response("<Response><Gather input='speech' timeout='3'><Say>Welcome to Aerosus Support. Briefly, what is the problem?</Say></Gather></Response>", mimetype='text/xml')
 
     if not user_input:
@@ -80,24 +79,24 @@ def voice():
     context = call_context[call_sid]
     context['history'].append(f"User: {user_input}")
     
-    # --- STRICT ORDER PROMPT ---
+    # --- UPDATED PROMPT: SILENT INSTRUCTIONS ---
     prompt = f"""
-    History: {context['history']}
+    You are a helpful support agent.
+    Conversation History: {context['history']}
     
-    YOUR JOB: Follow this strict order.
+    INTERNAL INSTRUCTIONS (DO NOT READ THESE ALOUD):
+    1. Check if the user has described a problem.
+       - If NO problem: Ask "Could you describe the issue?"
+    2. Check if the user has provided an email.
+       - If NO email (but has problem): Ask "What is your email address?"
+    3. If you have BOTH problem and email:
+       - Output ONLY the command: ACTION_CREATE_TICKET: <email>
     
-    STEP 1: CHECK FOR PROBLEM.
-    - If the user hasn't clearly stated a problem yet, ask: "Could you describe the issue?"
-    
-    STEP 2: CHECK FOR EMAIL.
-    - If you have the problem, but NO email address, ask: "What is your email address?"
-    
-    STEP 3: FINALIZE.
-    - If you have BOTH the problem AND the email, output EXACTLY: ACTION_CREATE_TICKET: <email>
-    
-    RULES:
-    - "at" -> "@", "dot" -> ".", "a k i f" -> "akif"
-    - Do not output the ticket action until you have the email.
+    OUTPUT RULES:
+    - Do NOT output "Step 1" or "Step 2".
+    - Do NOT say "I will ask for your email". Just ask it.
+    - Example Output: "Could you please tell me your email address?"
+    - Email Rules: "at" -> "@", "dot" -> ".", "a k i f" -> "akif".
     """
     
     try:
@@ -125,7 +124,6 @@ def voice():
             ticket_id = create_zendesk_ticket(email, str(context['history']), total_cost)
             
             if ticket_id:
-                # EXACT PHRASE REQUESTED
                 msg = f"Ticket number {ticket_id} made. Goodbye."
             else:
                 msg = "Ticket made locally. Goodbye."
@@ -134,10 +132,9 @@ def voice():
             msg = "Error creating ticket. Goodbye."
             
         del call_context[call_sid]
-        # HANGUP COMMAND ADDED
         return Response(f"<Response><Say>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
 
-    # 5. Continue Conversation (Ask for email, etc.)
+    # 5. Continue Conversation
     context['history'].append(f"AI: {ai_reply}")
     return Response(f"<Response><Gather input='speech' timeout='3'><Say>{ai_reply}</Say></Gather></Response>", mimetype='text/xml')
 
