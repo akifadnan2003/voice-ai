@@ -26,7 +26,7 @@ PRICE_GEMINI_OUTPUT_1K = 0.00030
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     # SWITCHING MODEL to 'gemini-pro' to fix the 404 error
-    model = genai.GenerativeModel("gemini-pro") 
+    model = genai.GenerativeModel("gemini-2.0-flash")
 else:
     print("⚠️ WARNING: GEMINI_API_KEY is missing!")
 
