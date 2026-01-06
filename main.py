@@ -31,6 +31,22 @@ else:
 call_context = {}
 
 
+# High-level ticket taxonomy (used only to guide the model's questions).
+# Keep this concise to avoid prompt bloat while still steering toward typical Aerosus cases.
+TICKET_TYPE_GUIDE = """
+Common Aerosus support reasons (most calls fall into one of these):
+- Order info: order status, tracking number, invoice copy
+- Order issues: cancellation, address change, payment failed, VAT not recognized, discount issues
+- Delivery issues: courier/customs/payment issues, delayed delivery
+- Returns/RMA: damaged/faulty item (new/used), wrong/ordered-wrong item, warranty, refund requests, return label not received
+- Compatibility/availability: part compatibility check, stock information
+- Technical support: installation questions, relay position, product questions (air suspension components)
+- B2B: partnership, discount request
+
+If unclear, ask a short clarifying question to categorize (order vs return/refund vs technical).
+""".strip()
+
+
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
@@ -68,7 +84,27 @@ def normalize_problem_text(text: str) -> str:
 
     # We are an automotive air-suspension company; ASR often turns "air" into "ear".
     normalized = text
+
+    # Air suspension phrasing
     normalized = re.sub(r"\bear\s+suspension\b", "air suspension", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bair\s+suspensions\b", "air suspension", normalized, flags=re.IGNORECASE)
+
+    # Brand name often gets mangled
+    normalized = re.sub(r"\baero\s+sus\b", "Aerosus", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bero\s+sus\b", "Aerosus", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\baeros\s+us\b", "Aerosus", normalized, flags=re.IGNORECASE)
+
+    # Common automotive terms that ASR splits
+    normalized = re.sub(r"\bcompress\s+or\b", "compressor", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bshock\s+absorber\b", "shock absorber", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bstruts\b", "strut", normalized, flags=re.IGNORECASE)
+
+    # Order/RMA vocabulary normalization
+    normalized = re.sub(r"\br\s*m\s*a\b", "RMA", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\brefunds\b", "refund", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\breturns\b", "return", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\btracking\s+number\b", "tracking number", normalized, flags=re.IGNORECASE)
+
     return normalized
 
 def calculate_cost(duration_sec, in_tok, out_tok):
@@ -196,6 +232,13 @@ You are a helpful customer support agent for Aerosus.
 Context about Aerosus (important):
 - Aerosus sells automotive air suspension components (car parts).
 - If the user says "ear suspension", they almost certainly mean "air suspension".
+
+Speech-to-text correction guidance:
+- Treat "ear suspension" as "air suspension".
+- Treat common variants like "aero sus" as "Aerosus".
+
+Ticket-type guidance (very important for your next question):
+{TICKET_TYPE_GUIDE}
 
 Conversation History:
 {chr(10).join(context['history'])}
