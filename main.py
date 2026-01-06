@@ -48,6 +48,7 @@ If unclear, ask a short clarifying question to categorize (order vs return/refun
 
 
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+EMAIL_IN_TEXT_RE = re.compile(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", re.IGNORECASE)
 
 
 AFFIRMATIVE_RE = re.compile(r"\b(yes|yeah|yep|correct|that's\s+right|that\s+is\s+right|right|sure|affirmative)\b", re.IGNORECASE)
@@ -79,6 +80,23 @@ def normalize_spoken_email(text: str) -> str:
 
 def is_valid_email(email: str) -> bool:
     return bool(email) and bool(EMAIL_RE.match(email))
+
+
+def extract_email_from_utterance(text: str) -> str:
+    """Extract a valid email from a longer utterance like 'my email is ...'."""
+    if not text:
+        return ""
+
+    normalized = normalize_spoken_email(text)
+    if is_valid_email(normalized):
+        return normalized
+
+    match = EMAIL_IN_TEXT_RE.search(normalized)
+    if not match:
+        return ""
+
+    candidate = match.group(0).lower().strip(".,;:!?")
+    return candidate if is_valid_email(candidate) else ""
 
 
 def is_affirmative(text: str) -> bool:
@@ -258,9 +276,9 @@ def voice():
     # If we already captured an email but haven't confirmed it yet, handle confirmation first.
     if context.get("email") and not context.get("email_confirmed"):
         # User can either answer yes/no, or repeat/provide a new email.
-        normalized_email = normalize_spoken_email(user_input)
-        if is_valid_email(normalized_email):
-            context["email"] = normalized_email
+        extracted_email = extract_email_from_utterance(user_input)
+        if extracted_email:
+            context["email"] = extracted_email
             spelled = spell_email_address(context["email"])
             ai_reply = f"I heard {spelled}. Is that correct?"
             context["history"].append(f"AI: {ai_reply}")
@@ -289,9 +307,9 @@ def voice():
             )
 
     # Detect/normalize email from the user's utterance (deterministic, not model-driven)
-    normalized_email = normalize_spoken_email(user_input)
-    if not context.get("email") and is_valid_email(normalized_email):
-        context["email"] = normalized_email
+    extracted_email = extract_email_from_utterance(user_input)
+    if not context.get("email") and extracted_email:
+        context["email"] = extracted_email
 
     # If we just captured an email (and it's not confirmed yet), confirm by spelling local-part up to '@'.
     if context.get("email") and not context.get("email_confirmed"):
@@ -304,7 +322,7 @@ def voice():
         )
 
     # Capture/accumulate problem details until we get a valid email.
-    if not context.get("email") and not is_valid_email(normalized_email):
+    if not context.get("email") and not extracted_email:
         if not context.get("problem"):
             context["problem"] = normalize_problem_text(user_input.strip())
         else:
