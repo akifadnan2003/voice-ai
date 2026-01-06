@@ -50,6 +50,10 @@ If unclear, ask a short clarifying question to categorize (order vs return/refun
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
+AFFIRMATIVE_RE = re.compile(r"\b(yes|yeah|yep|correct|that's\s+right|that\s+is\s+right|right|sure|affirmative)\b", re.IGNORECASE)
+NEGATIVE_RE = re.compile(r"\b(no|nope|nah|incorrect|wrong|negative|not\s+right)\b", re.IGNORECASE)
+
+
 def normalize_spoken_email(text: str) -> str:
     """Best-effort conversion of spoken email to a real email string."""
     if not text:
@@ -75,6 +79,73 @@ def normalize_spoken_email(text: str) -> str:
 
 def is_valid_email(email: str) -> bool:
     return bool(email) and bool(EMAIL_RE.match(email))
+
+
+def is_affirmative(text: str) -> bool:
+    return bool(text) and bool(AFFIRMATIVE_RE.search(text))
+
+
+def is_negative(text: str) -> bool:
+    return bool(text) and bool(NEGATIVE_RE.search(text))
+
+
+def spell_email_address(email: str) -> str:
+    """Return a speakable confirmation string for an email address.
+
+    - Spells the local-part letter-by-letter.
+    - Speaks common domains as a whole (e.g., 'gmail.com') since they're standard.
+    """
+    if not email:
+        return ""
+
+    cleaned = email.strip().lower()
+    if "@" not in cleaned:
+        return ""
+
+    local_part, domain = cleaned.split("@", 1)
+    local_part = local_part.strip()
+    domain = domain.strip()
+    if not local_part or not domain:
+        return ""
+
+    token_map = {
+        ".": "dot",
+        "_": "underscore",
+        "-": "dash",
+        "+": "plus",
+    }
+
+    common_domains = {
+        "gmail.com",
+        "outlook.com",
+        "hotmail.com",
+        "live.com",
+        "yahoo.com",
+        "icloud.com",
+        "aol.com",
+        "proton.me",
+        "protonmail.com",
+    }
+
+    spoken_local = []
+    for ch in local_part:
+        if ch.isalnum():
+            spoken_local.append(ch)
+        elif ch in token_map:
+            spoken_local.append(token_map[ch])
+
+    if domain in common_domains:
+        spoken_domain = domain
+    else:
+        spoken_domain_tokens = []
+        for ch in domain:
+            if ch.isalnum():
+                spoken_domain_tokens.append(ch)
+            elif ch in token_map:
+                spoken_domain_tokens.append(token_map[ch])
+        spoken_domain = " ".join(spoken_domain_tokens)
+
+    return f"{' '.join(spoken_local)} at {spoken_domain}".strip()
 
 
 def normalize_problem_text(text: str) -> str:
@@ -157,6 +228,7 @@ def voice():
             "history": [],
             "problem": "",
             "email": "",
+            "email_confirmed": False,
             "start_time": time.time(),
             "input_tokens": 0,
             "output_tokens": 0,
@@ -183,10 +255,53 @@ def voice():
     # Track transcript
     context["history"].append(f"User: {user_input}")
 
+    # If we already captured an email but haven't confirmed it yet, handle confirmation first.
+    if context.get("email") and not context.get("email_confirmed"):
+        # User can either answer yes/no, or repeat/provide a new email.
+        normalized_email = normalize_spoken_email(user_input)
+        if is_valid_email(normalized_email):
+            context["email"] = normalized_email
+            spelled = spell_email_address(context["email"])
+            ai_reply = f"I heard {spelled}. Is that correct?"
+            context["history"].append(f"AI: {ai_reply}")
+            return Response(
+                f"<Response><Gather input='speech' timeout='3'><Say>{ai_reply}</Say></Gather></Response>",
+                mimetype='text/xml'
+            )
+
+        if is_affirmative(user_input):
+            context["email_confirmed"] = True
+        elif is_negative(user_input):
+            context["email"] = ""
+            context["email_confirmed"] = False
+            ai_reply = "Ok to proceed with your request provide me your email."
+            context["history"].append(f"AI: {ai_reply}")
+            return Response(
+                f"<Response><Gather input='speech' timeout='3'><Say>{ai_reply}</Say></Gather></Response>",
+                mimetype='text/xml'
+            )
+        else:
+            ai_reply = "Please say yes or no."
+            context["history"].append(f"AI: {ai_reply}")
+            return Response(
+                f"<Response><Gather input='speech' timeout='3'><Say>{ai_reply}</Say></Gather></Response>",
+                mimetype='text/xml'
+            )
+
     # Detect/normalize email from the user's utterance (deterministic, not model-driven)
     normalized_email = normalize_spoken_email(user_input)
     if not context.get("email") and is_valid_email(normalized_email):
         context["email"] = normalized_email
+
+    # If we just captured an email (and it's not confirmed yet), confirm by spelling local-part up to '@'.
+    if context.get("email") and not context.get("email_confirmed"):
+        spelled = spell_email_address(context["email"])
+        ai_reply = f"I heard {spelled}. Is that correct?"
+        context["history"].append(f"AI: {ai_reply}")
+        return Response(
+            f"<Response><Gather input='speech' timeout='3'><Say>{ai_reply}</Say></Gather></Response>",
+            mimetype='text/xml'
+        )
 
     # Capture/accumulate problem details until we get a valid email.
     if not context.get("email") and not is_valid_email(normalized_email):
@@ -208,8 +323,8 @@ def voice():
             mimetype='text/xml'
         )
 
-    # If we have both problem and email: create ticket, confirm, and hang up.
-    if context.get("problem") and context.get("email"):
+    # If we have both problem and a confirmed email: create ticket, confirm, and hang up.
+    if context.get("problem") and context.get("email") and context.get("email_confirmed"):
         duration = time.time() - context["start_time"]
         total_cost = calculate_cost(duration, context.get("input_tokens", 0), context.get("output_tokens", 0))
 
