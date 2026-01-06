@@ -31,6 +31,14 @@ else:
 call_context = {}
 
 
+DEBUG_CALL_FLOW = os.environ.get("DEBUG_CALL_FLOW", "").strip().lower() in {"1", "true", "yes"}
+
+
+def debug_log(message: str) -> None:
+    if DEBUG_CALL_FLOW:
+        print(message)
+
+
 # High-level ticket taxonomy (used only to guide the model's questions).
 # Keep this concise to avoid prompt bloat while still steering toward typical Aerosus cases.
 TICKET_TYPE_GUIDE = """
@@ -62,6 +70,16 @@ def normalize_spoken_email(text: str) -> str:
 
     cleaned = text.strip().lower()
 
+    # Remove very common leading filler words (before we delete spaces).
+    cleaned = re.sub(r"^(uh|um|er|ah|hmm|mmm)[\s,]+", "", cleaned, flags=re.IGNORECASE)
+
+    # Remove common intro phrases.
+    cleaned = re.sub(r"\b(my\s+)?e-?mail\s+is\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bemail\b", " ", cleaned, flags=re.IGNORECASE)
+
+    # Remove filler words that sometimes get inserted mid-utterance.
+    cleaned = re.sub(r"\b(uh|um|er|ah|hmm|mmm)\b", " ", cleaned, flags=re.IGNORECASE)
+
     # Remove common punctuation that speech engines append.
     cleaned = cleaned.replace("<", "").replace(">", "").strip(" \t\r\n.,;:!?")
 
@@ -72,6 +90,10 @@ def normalize_spoken_email(text: str) -> str:
 
     # Remove spaces that are often inserted between characters.
     cleaned = cleaned.replace(" ", "")
+
+    # Drop any characters that cannot appear in an email address.
+    # (This removes commas like in "uh,akif@gmail.com".)
+    cleaned = re.sub(r"[^a-z0-9@._%+\-]", "", cleaned)
 
     # Final trim of stray punctuation.
     cleaned = cleaned.strip(".,;:!?")
@@ -212,6 +234,8 @@ def create_zendesk_ticket(user_email, issue_summary, cost):
     encoded_creds = base64.b64encode(creds.encode()).decode()
     
     clean_email = user_email.replace("<", "").replace(">", "").strip()
+    # Extra safety: ensure Zendesk only receives a properly formatted email string.
+    clean_email = re.sub(r"[^a-zA-Z0-9@._%+\-]", "", clean_email)
     user_name = clean_email.split("@")[0]
 
     payload = {
@@ -247,6 +271,7 @@ def voice():
             "problem": "",
             "email": "",
             "email_confirmed": False,
+            "awaiting_email_confirmation": False,
             "start_time": time.time(),
             "input_tokens": 0,
             "output_tokens": 0,
@@ -272,6 +297,7 @@ def voice():
 
     # Track transcript
     context["history"].append(f"User: {user_input}")
+    debug_log(f"[voice] CallSid={call_sid} SpeechResult={user_input!r}")
 
     # If we already captured an email but haven't confirmed it yet, handle confirmation first.
     if context.get("email") and not context.get("email_confirmed"):
@@ -279,6 +305,8 @@ def voice():
         extracted_email = extract_email_from_utterance(user_input)
         if extracted_email:
             context["email"] = extracted_email
+            context["email_confirmed"] = False
+            context["awaiting_email_confirmation"] = True
             spelled = spell_email_address(context["email"])
             ai_reply = f"I heard {spelled}. Is that correct?"
             context["history"].append(f"AI: {ai_reply}")
@@ -287,11 +315,13 @@ def voice():
                 mimetype='text/xml'
             )
 
-        if is_affirmative(user_input):
+        if context.get("awaiting_email_confirmation") and is_affirmative(user_input):
             context["email_confirmed"] = True
-        elif is_negative(user_input):
+            context["awaiting_email_confirmation"] = False
+        elif context.get("awaiting_email_confirmation") and is_negative(user_input):
             context["email"] = ""
             context["email_confirmed"] = False
+            context["awaiting_email_confirmation"] = False
             ai_reply = "Ok to proceed with your request provide me your email."
             context["history"].append(f"AI: {ai_reply}")
             return Response(
@@ -299,7 +329,10 @@ def voice():
                 mimetype='text/xml'
             )
         else:
-            ai_reply = "Please say yes or no."
+            spelled = spell_email_address(context.get("email", ""))
+            # Re-prompt confirmation (or prompt it for the first time) rather than getting stuck.
+            ai_reply = f"I heard {spelled}. Is that correct?" if spelled else "Ok to proceed with your request provide me your email."
+            context["awaiting_email_confirmation"] = bool(spelled)
             context["history"].append(f"AI: {ai_reply}")
             return Response(
                 f"<Response><Gather input='speech' timeout='3'><Say>{ai_reply}</Say></Gather></Response>",
@@ -310,11 +343,15 @@ def voice():
     extracted_email = extract_email_from_utterance(user_input)
     if not context.get("email") and extracted_email:
         context["email"] = extracted_email
+        context["email_confirmed"] = False
+        context["awaiting_email_confirmation"] = True
+    debug_log(f"[voice] extracted_email={extracted_email!r} stored_email={context.get('email')!r} confirmed={context.get('email_confirmed')} awaiting={context.get('awaiting_email_confirmation')}")
 
     # If we just captured an email (and it's not confirmed yet), confirm by spelling local-part up to '@'.
     if context.get("email") and not context.get("email_confirmed"):
         spelled = spell_email_address(context["email"])
         ai_reply = f"I heard {spelled}. Is that correct?"
+        context["awaiting_email_confirmation"] = True
         context["history"].append(f"AI: {ai_reply}")
         return Response(
             f"<Response><Gather input='speech' timeout='3'><Say>{ai_reply}</Say></Gather></Response>",
