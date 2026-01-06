@@ -51,8 +51,57 @@ Common Aerosus support reasons (most calls fall into one of these):
 - Technical support: installation questions, relay position, product questions (air suspension components)
 - B2B: partnership, discount request
 
-If unclear, ask a short clarifying question to categorize (order vs return/refund vs technical).
 """.strip()
+
+
+# Speech recognition hints for Twilio to improve accuracy on domain-specific words.
+# Keep this short-ish; overly long hint lists can become counterproductive.
+SPEECH_HINTS = (
+    "Aerosus, air suspension, compressor, strut, shock absorber, relay, "
+    "RMA, refund, return, tracking number, order number, invoice, "
+    "gmail, outlook, hotmail, yahoo, icloud, protonmail, at, dot, underscore, dash"
+)
+
+
+# English-only enforcement (deterministic heuristics, no external deps).
+_NON_LATIN_SCRIPT_RE = re.compile(
+    r"[\u0400-\u04FF\u0600-\u06FF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]"
+)
+
+_NON_ENGLISH_MARKERS = {
+    # Greetings / common words
+    "hola", "gracias", "bonjour", "merci", "salut", "hallo", "danke", "bitte", "ciao", "grazie", "ola", "obrigado",
+    # Common support-ish words in other languages
+    "pedido", "envio", "reembolso", "devolucion", "factura",
+    "commande", "livraison", "remboursement",
+    "bestellung", "lieferung", "rueckerstattung", "rückerstattung",
+}
+
+
+def is_likely_non_english(text: str) -> bool:
+    if not text:
+        return False
+
+    # Don't block emails or numeric-only inputs.
+    if extract_email_from_utterance(text):
+        return False
+    if re.fullmatch(r"[\s0-9+\-#()]+", text.strip() or ""):
+        return False
+
+    # Strong signal: non-Latin scripts.
+    if _NON_LATIN_SCRIPT_RE.search(text):
+        return True
+
+    # Strict English-only: any non-ASCII char is treated as non-English.
+    if any(ord(ch) > 127 for ch in text):
+        return True
+
+    words = re.findall(r"[a-z']+", text.lower())
+    if len(words) < 3:
+        return False
+
+    marker_hits = sum(1 for w in words if w in _NON_ENGLISH_MARKERS)
+    return marker_hits >= 2
 
 
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -272,12 +321,14 @@ def voice():
             "email": "",
             "email_confirmed": False,
             "awaiting_email_confirmation": False,
+            "email_confirm_attempts": 0,
+            "english_warning_count": 0,
             "start_time": time.time(),
             "input_tokens": 0,
             "output_tokens": 0,
         }
         return Response(
-            "<Response><Gather input='speech' timeout='3'><Say>Welcome to Aerosus customer support. How may I help you?</Say></Gather></Response>",
+            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>Welcome to Aerosus customer support. How may I help you?</Say></Gather></Response>",
             mimetype='text/xml'
         )
 
@@ -291,7 +342,23 @@ def voice():
             prompt_text = "I am listening. What is the problem?"
 
         return Response(
-            f"<Response><Gather input='speech' timeout='3'><Say>{prompt_text}</Say></Gather></Response>",
+            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{prompt_text}</Say></Gather></Response>",
+            mimetype='text/xml'
+        )
+
+    # English-only enforcement: warn once, then hang up.
+    if is_likely_non_english(user_input):
+        context["english_warning_count"] = int(context.get("english_warning_count", 0)) + 1
+        if context["english_warning_count"] >= 2:
+            msg = "Proceed in English."
+            context["history"].append(f"AI: {msg}")
+            del call_context[call_sid]
+            return Response(f"<Response><Say>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
+
+        msg = "Proceed in English."
+        context["history"].append(f"AI: {msg}")
+        return Response(
+            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{msg}</Say></Gather></Response>",
             mimetype='text/xml'
         )
 
@@ -307,11 +374,12 @@ def voice():
             context["email"] = extracted_email
             context["email_confirmed"] = False
             context["awaiting_email_confirmation"] = True
+            context["email_confirm_attempts"] = int(context.get("email_confirm_attempts", 0)) + 1
             spelled = spell_email_address(context["email"])
             ai_reply = f"I heard {spelled}. Is that correct?"
             context["history"].append(f"AI: {ai_reply}")
             return Response(
-                f"<Response><Gather input='speech' timeout='3'><Say>{ai_reply}</Say></Gather></Response>",
+                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{ai_reply}</Say></Gather></Response>",
                 mimetype='text/xml'
             )
 
@@ -322,20 +390,25 @@ def voice():
             context["email"] = ""
             context["email_confirmed"] = False
             context["awaiting_email_confirmation"] = False
+            context["email_confirm_attempts"] = int(context.get("email_confirm_attempts", 0)) + 1
             ai_reply = "Ok to proceed with your request provide me your email."
             context["history"].append(f"AI: {ai_reply}")
             return Response(
-                f"<Response><Gather input='speech' timeout='3'><Say>{ai_reply}</Say></Gather></Response>",
+                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{ai_reply}</Say></Gather></Response>",
                 mimetype='text/xml'
             )
         else:
             spelled = spell_email_address(context.get("email", ""))
             # Re-prompt confirmation (or prompt it for the first time) rather than getting stuck.
-            ai_reply = f"I heard {spelled}. Is that correct?" if spelled else "Ok to proceed with your request provide me your email."
+            attempts = int(context.get("email_confirm_attempts", 0))
+            if attempts >= 2 and not extracted_email:
+                ai_reply = "Please say your email one character at a time."
+            else:
+                ai_reply = f"I heard {spelled}. Is that correct?" if spelled else "Ok to proceed with your request provide me your email."
             context["awaiting_email_confirmation"] = bool(spelled)
             context["history"].append(f"AI: {ai_reply}")
             return Response(
-                f"<Response><Gather input='speech' timeout='3'><Say>{ai_reply}</Say></Gather></Response>",
+                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{ai_reply}</Say></Gather></Response>",
                 mimetype='text/xml'
             )
 
@@ -345,6 +418,7 @@ def voice():
         context["email"] = extracted_email
         context["email_confirmed"] = False
         context["awaiting_email_confirmation"] = True
+        context["email_confirm_attempts"] = int(context.get("email_confirm_attempts", 0)) + 1
     debug_log(f"[voice] extracted_email={extracted_email!r} stored_email={context.get('email')!r} confirmed={context.get('email_confirmed')} awaiting={context.get('awaiting_email_confirmation')}")
 
     # If we just captured an email (and it's not confirmed yet), confirm by spelling local-part up to '@'.
@@ -354,7 +428,7 @@ def voice():
         context["awaiting_email_confirmation"] = True
         context["history"].append(f"AI: {ai_reply}")
         return Response(
-            f"<Response><Gather input='speech' timeout='3'><Say>{ai_reply}</Say></Gather></Response>",
+            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{ai_reply}</Say></Gather></Response>",
             mimetype='text/xml'
         )
 
@@ -374,7 +448,7 @@ def voice():
         ai_reply = "Ok to proceed with your request provide me your email."
         context["history"].append(f"AI: {ai_reply}")
         return Response(
-            f"<Response><Gather input='speech' timeout='3'><Say>{ai_reply}</Say></Gather></Response>",
+            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{ai_reply}</Say></Gather></Response>",
             mimetype='text/xml'
         )
 
@@ -453,7 +527,10 @@ EMAIL NORMALIZATION GUIDANCE (for recognition):
             ai_reply = "Could you repeat that, please?"
 
     context["history"].append(f"AI: {ai_reply}")
-    return Response(f"<Response><Gather input='speech' timeout='3'><Say>{ai_reply}</Say></Gather></Response>", mimetype='text/xml')
+    return Response(
+        f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{ai_reply}</Say></Gather></Response>",
+        mimetype='text/xml'
+    )
 
 if __name__ == "__main__":
     app.run(debug=True, port=8080)
