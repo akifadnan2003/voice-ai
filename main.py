@@ -97,6 +97,9 @@ SPEECH_HINTS = (
     "gmail, outlook, hotmail, yahoo, icloud, protonmail, at, dot, underscore, dash"
 )
 
+# Twilio <Say> voice override (Amazon Polly Neural)
+VOICE_NAME = os.environ.get("TWILIO_VOICE_NAME", "Polly.Amy-Neural")
+
 # --- LANGUAGE DETECTION (Double Defense Layer 1) ---
 _NON_LATIN_SCRIPT_RE = re.compile(r"[\u0400-\u04FF\u0600-\u06FF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]")
 _NON_ENGLISH_MARKERS = {
@@ -265,7 +268,7 @@ def voice():
             "output_tokens": 0,
         }
         return Response(
-            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>Welcome to Aerosus customer support. How may I help you?</Say></Gather></Response>",
+            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>Welcome to Aerosus customer support. How may I help you?</Say></Gather></Response>",
             mimetype='text/xml'
         )
 
@@ -284,7 +287,7 @@ def voice():
             prompt_text = "I am listening. What is the problem?"
         
         return Response(
-            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{prompt_text}</Say></Gather></Response>",
+            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{prompt_text}</Say></Gather></Response>",
             mimetype='text/xml'
         )
 
@@ -297,13 +300,13 @@ def voice():
         if context["english_warning_count"] >= 2:
             msg = "This call can only be processed in English. Please try again later."
             del call_context[call_sid]
-            return Response(f"<Response><Say>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
+            return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
         
         # STRIKE 1
         msg = "Please speak in English."
         context["history"].append(f"AI: {msg}")
         return Response(
-            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{msg}</Say></Gather></Response>",
+            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{msg}</Say></Gather></Response>",
             mimetype='text/xml'
         )
     else:
@@ -327,7 +330,7 @@ def voice():
             ai_reply = f"I heard {spelled}. Is that correct?"
             context["history"].append(f"AI: {ai_reply}")
             return Response(
-                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{ai_reply}</Say></Gather></Response>",
+                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
                 mimetype='text/xml'
             )
 
@@ -341,7 +344,7 @@ def voice():
             ai_reply = "Ok to proceed with your request provide me your email."
             context["history"].append(f"AI: {ai_reply}")
             return Response(
-                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{ai_reply}</Say></Gather></Response>",
+                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
                 mimetype='text/xml'
             )
         else:
@@ -350,7 +353,7 @@ def voice():
             ai_reply = f"I heard {spelled}. Is that correct?"
             context["history"].append(f"AI: {ai_reply}")
             return Response(
-                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{ai_reply}</Say></Gather></Response>",
+                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
                 mimetype='text/xml'
             )
 
@@ -366,7 +369,7 @@ def voice():
         ai_reply = f"I heard {spelled}. Is that correct?"
         context["history"].append(f"AI: {ai_reply}")
         return Response(
-            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{ai_reply}</Say></Gather></Response>",
+            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
             mimetype='text/xml'
         )
 
@@ -405,7 +408,7 @@ def voice():
 
         msg = "Ok ticket created. Closing the call." if ticket_id else "I could not create the ticket right now. Closing the call."
         del call_context[call_sid]
-        return Response(f"<Response><Say>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
+        return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
 
     # 10. GEMINI BRAIN (With Double Defense & Smart Email Extraction)
     prompt = f"""
@@ -458,12 +461,12 @@ OUTPUT RULES:
             if context["english_warning_count"] >= 2:
                 msg = "This call can only be processed in English. Please try again later."
                 del call_context[call_sid]
-                return Response(f"<Response><Say>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
+                return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
             
             msg = "Please speak in English."
             context["history"].append(f"AI: {msg}")
             return Response(
-                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{msg}</Say></Gather></Response>",
+                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{msg}</Say></Gather></Response>",
                 mimetype='text/xml'
             )
 
@@ -482,7 +485,7 @@ OUTPUT RULES:
             ai_reply = f"I heard {spelled}. Is that correct?"
             context["history"].append(f"AI: {ai_reply}")
             return Response(
-                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{ai_reply}</Say></Gather></Response>",
+                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
                 mimetype='text/xml'
             )
 
@@ -501,7 +504,7 @@ OUTPUT RULES:
 
     context["history"].append(f"AI: {ai_reply}")
     return Response(
-        f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{ai_reply}</Say></Gather></Response>",
+        f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
         mimetype='text/xml'
     )
 
