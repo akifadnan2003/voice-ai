@@ -4,6 +4,7 @@ import requests
 import base64
 import re
 import math
+import traceback
 from flask import Flask, request, Response
 import google.generativeai as genai
 
@@ -43,6 +44,44 @@ DEBUG_CALL_FLOW = os.environ.get("DEBUG_CALL_FLOW", "").strip().lower() in {"1",
 def debug_log(message: str) -> None:
     if DEBUG_CALL_FLOW:
         print(message)
+
+
+def _mask_email(value: str) -> str:
+    if not value:
+        return ""
+    value = str(value).strip()
+    if "@" not in value:
+        return value[:2] + "***" if len(value) > 2 else "***"
+    local, domain = value.split("@", 1)
+    if not local:
+        return "***@" + domain
+    return f"{local[0]}***@{domain}"
+
+
+def debug_event(stage: str, call_sid: str | None = None, **fields) -> None:
+    if not DEBUG_CALL_FLOW:
+        return
+
+    safe_fields = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        if key in {"email", "user_email", "extracted_email", "stored_email"}:
+            value = _mask_email(str(value))
+        safe_fields.append(f"{key}={value!r}")
+
+    prefix = f"[voice:{stage}]"
+    if call_sid:
+        prefix += f" CallSid={call_sid}"
+
+    debug_log(prefix + (" " + " ".join(safe_fields) if safe_fields else ""))
+
+
+def debug_exception(stage: str, call_sid: str | None = None, err: Exception | None = None) -> None:
+    if not DEBUG_CALL_FLOW:
+        return
+    debug_event(stage, call_sid=call_sid, error=str(err) if err else "")
+    debug_log(traceback.format_exc())
 
 
 # High-level ticket taxonomy (used only to guide the model's questions).
@@ -309,6 +348,7 @@ def create_zendesk_ticket(user_email, issue_summary, cost):
     headers = {"Content-Type": "application/json", "Authorization": f"Basic {encoded_creds}"}
     
     try:
+        debug_event("zendesk_request", call_sid=None, email=clean_email, subject=payload.get("ticket", {}).get("subject"), timeout=15)
         response = requests.post(url, json=payload, headers=headers, timeout=15)
         if response.status_code == 201:
             return response.json()["ticket"]["id"]
@@ -323,6 +363,7 @@ def create_zendesk_ticket(user_email, issue_summary, cost):
 def voice():
     call_sid = request.values.get('CallSid')
     user_input = request.values.get('SpeechResult')
+    debug_event("incoming", call_sid=call_sid, has_speech=bool(user_input))
     
     # 1) Start call -> ask for the problem
     if call_sid not in call_context:
@@ -333,24 +374,46 @@ def voice():
             "email_confirmed": False,
             "awaiting_email_confirmation": False,
             "email_confirm_attempts": 0,
+            "email_request_attempts": 0,
             "english_warning_count": 0,
             "start_time": time.time(),
             "input_tokens": 0,
             "output_tokens": 0,
         }
+        debug_event("start_call", call_sid=call_sid)
         return Response(
             f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>Welcome to Aerosus customer support. How may I help you?</Say></Gather></Response>",
             mimetype='text/xml'
         )
 
     context = call_context[call_sid]
+    debug_event(
+        "state",
+        call_sid=call_sid,
+        problem=bool(context.get("problem")),
+        email=bool(context.get("email")),
+        email_confirmed=bool(context.get("email_confirmed")),
+        awaiting_email_confirmation=bool(context.get("awaiting_email_confirmation")),
+        english_warning_count=context.get("english_warning_count"),
+        email_request_attempts=context.get("email_request_attempts"),
+        email_confirm_attempts=context.get("email_confirm_attempts"),
+    )
 
     if not user_input:
+        debug_event("no_speech", call_sid=call_sid)
         # If we already got the problem, we must ask for email using the exact phrasing requested.
         if context.get("problem") and not context.get("email"):
-            prompt_text = "Ok to proceed with your request provide me your email."
+            # Avoid repeating the same prompt forever if the caller isn't providing a valid email.
+            attempts = int(context.get("email_request_attempts", 0))
+            if attempts >= 2:
+                prompt_text = "Please say your email one character at a time."
+            else:
+                prompt_text = "Ok to proceed with your request provide me your email."
+            context["email_request_attempts"] = attempts + 1
+            debug_event("prompt_email_no_speech", call_sid=call_sid, attempt=context["email_request_attempts"], prompt=prompt_text)
         else:
             prompt_text = "I am listening. What is the problem?"
+            debug_event("prompt_problem_no_speech", call_sid=call_sid, prompt=prompt_text)
 
         return Response(
             f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{prompt_text}</Say></Gather></Response>",
@@ -359,15 +422,18 @@ def voice():
 
     # English-only enforcement: warn once, then close the call if the caller continues in a foreign language.
     if is_likely_non_english(user_input):
+        debug_event("non_english_detected", call_sid=call_sid, text=user_input)
         context["english_warning_count"] = int(context.get("english_warning_count", 0)) + 1
         if context["english_warning_count"] >= 2:
             msg = "This call can only be processed in English. Please try again later."
             context["history"].append(f"AI: {msg}")
             del call_context[call_sid]
+            debug_event("hangup_non_english", call_sid=call_sid, warning_count=context["english_warning_count"], msg=msg)
             return Response(f"<Response><Say>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
 
         msg = "Please speak in English."
         context["history"].append(f"AI: {msg}")
+        debug_event("warn_non_english", call_sid=call_sid, warning_count=context["english_warning_count"], msg=msg)
         return Response(
             f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{msg}</Say></Gather></Response>",
             mimetype='text/xml'
@@ -375,16 +441,19 @@ def voice():
     else:
         # Reset after an English utterance so an early warning doesn't cause a later accidental hangup.
         context["english_warning_count"] = 0
+        debug_event("english_ok", call_sid=call_sid)
 
     # Track transcript
     context["history"].append(f"User: {user_input}")
-    debug_log(f"[voice] CallSid={call_sid} SpeechResult={user_input!r}")
+    debug_event("transcript", call_sid=call_sid, text=user_input)
 
     # If we already captured an email but haven't confirmed it yet, handle confirmation first.
     if context.get("email") and not context.get("email_confirmed"):
+        debug_event("email_confirmation_flow", call_sid=call_sid, stored_email=context.get("email"), awaiting=context.get("awaiting_email_confirmation"))
         # User can either answer yes/no, or repeat/provide a new email.
         extracted_email = extract_email_from_utterance(user_input)
         if extracted_email:
+            debug_event("email_replaced", call_sid=call_sid, extracted_email=extracted_email)
             context["email"] = extracted_email
             context["email_confirmed"] = False
             context["awaiting_email_confirmation"] = True
@@ -392,6 +461,7 @@ def voice():
             spelled = spell_email_address(context["email"])
             ai_reply = f"I heard {spelled}. Is that correct?"
             context["history"].append(f"AI: {ai_reply}")
+            debug_event("email_confirm_prompt", call_sid=call_sid, prompt=ai_reply, confirm_attempt=context.get("email_confirm_attempts"))
             return Response(
                 f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{ai_reply}</Say></Gather></Response>",
                 mimetype='text/xml'
@@ -400,6 +470,7 @@ def voice():
         if context.get("awaiting_email_confirmation") and is_affirmative(user_input):
             context["email_confirmed"] = True
             context["awaiting_email_confirmation"] = False
+            debug_event("email_confirmed_yes", call_sid=call_sid, email=context.get("email"))
         elif context.get("awaiting_email_confirmation") and is_negative(user_input):
             context["email"] = ""
             context["email_confirmed"] = False
@@ -407,6 +478,7 @@ def voice():
             context["email_confirm_attempts"] = int(context.get("email_confirm_attempts", 0)) + 1
             ai_reply = "Ok to proceed with your request provide me your email."
             context["history"].append(f"AI: {ai_reply}")
+            debug_event("email_confirmed_no", call_sid=call_sid, prompt=ai_reply, confirm_attempt=context.get("email_confirm_attempts"))
             return Response(
                 f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{ai_reply}</Say></Gather></Response>",
                 mimetype='text/xml'
@@ -421,6 +493,7 @@ def voice():
                 ai_reply = f"I heard {spelled}. Is that correct?" if spelled else "Ok to proceed with your request provide me your email."
             context["awaiting_email_confirmation"] = bool(spelled)
             context["history"].append(f"AI: {ai_reply}")
+            debug_event("email_confirm_reprompt", call_sid=call_sid, prompt=ai_reply, spelled=bool(spelled), confirm_attempt=attempts)
             return Response(
                 f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{ai_reply}</Say></Gather></Response>",
                 mimetype='text/xml'
@@ -428,11 +501,15 @@ def voice():
 
     # Detect/normalize email from the user's utterance (deterministic, not model-driven)
     extracted_email = extract_email_from_utterance(user_input)
+    debug_event("email_extraction", call_sid=call_sid, extracted_email=extracted_email)
     if not context.get("email") and extracted_email:
         context["email"] = extracted_email
         context["email_confirmed"] = False
         context["awaiting_email_confirmation"] = True
         context["email_confirm_attempts"] = int(context.get("email_confirm_attempts", 0)) + 1
+        # Reset collection attempts once we successfully extract an email.
+        context["email_request_attempts"] = 0
+        debug_event("email_captured", call_sid=call_sid, email=context.get("email"), confirm_attempt=context.get("email_confirm_attempts"))
     debug_log(f"[voice] extracted_email={extracted_email!r} stored_email={context.get('email')!r} confirmed={context.get('email_confirmed')} awaiting={context.get('awaiting_email_confirmation')}")
 
     # If we just captured an email (and it's not confirmed yet), confirm by spelling local-part up to '@'.
@@ -441,6 +518,7 @@ def voice():
         ai_reply = f"I heard {spelled}. Is that correct?"
         context["awaiting_email_confirmation"] = True
         context["history"].append(f"AI: {ai_reply}")
+        debug_event("email_confirm_prompt", call_sid=call_sid, prompt=ai_reply)
         return Response(
             f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{ai_reply}</Say></Gather></Response>",
             mimetype='text/xml'
@@ -450,17 +528,25 @@ def voice():
     if not context.get("email") and not extracted_email:
         if not context.get("problem"):
             context["problem"] = normalize_problem_text(user_input.strip())
+            debug_event("problem_set", call_sid=call_sid, problem=context.get("problem"))
         else:
             # Add extra details (e.g., "It's leaking") to improve the ticket summary.
             extra = normalize_problem_text(user_input.strip())
             if extra and extra.lower() not in context["problem"].lower():
                 context["problem"] = f"{context['problem']} {extra}".strip()
+                debug_event("problem_extended", call_sid=call_sid, problem=context.get("problem"))
 
     # If we have problem but no email: ALWAYS ask for email using the exact phrasing requested.
     # This avoids Gemini drifting (e.g., asking extra questions) and guarantees the desired flow.
     if context.get("problem") and not context.get("email"):
-        ai_reply = "Ok to proceed with your request provide me your email."
+        attempts = int(context.get("email_request_attempts", 0))
+        if attempts >= 2:
+            ai_reply = "Please say your email one character at a time."
+        else:
+            ai_reply = "Ok to proceed with your request provide me your email."
+        context["email_request_attempts"] = attempts + 1
         context["history"].append(f"AI: {ai_reply}")
+        debug_event("prompt_email", call_sid=call_sid, attempt=context["email_request_attempts"], prompt=ai_reply)
         return Response(
             f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{ai_reply}</Say></Gather></Response>",
             mimetype='text/xml'
@@ -471,9 +557,19 @@ def voice():
         duration = time.time() - context["start_time"]
         total_cost = calculate_cost(duration, context.get("input_tokens", 0), context.get("output_tokens", 0))
 
+        debug_event(
+            "create_ticket",
+            call_sid=call_sid,
+            duration_sec=round(duration, 2),
+            bill_estimate=total_cost,
+            email=context.get("email"),
+        )
+
         transcript = "\n".join(context.get("history", []))
         issue_text = context.get("problem", "")
         ticket_id = create_zendesk_ticket(context["email"], f"{issue_text}\n\nTranscript:\n{transcript}", total_cost)
+
+        debug_event("ticket_result", call_sid=call_sid, ticket_id=ticket_id)
 
         if ticket_id:
             msg = "Ok ticket created. Closing the call."
@@ -481,6 +577,7 @@ def voice():
             msg = "I could not create the ticket right now. Closing the call."
 
         del call_context[call_sid]
+        debug_event("hangup_ticket", call_sid=call_sid, msg=msg)
         return Response(f"<Response><Say>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
 
     # Otherwise, continue with Gemini for general support dialog (while we still gather missing info).
@@ -525,13 +622,25 @@ EMAIL NORMALIZATION GUIDANCE (for recognition):
 """
 
     try:
+        debug_event("gemini_request", call_sid=call_sid, prompt_chars=len(prompt))
         response = model.generate_content(prompt)
         ai_reply = response.text.strip()
+
+        debug_event("gemini_response", call_sid=call_sid, reply_chars=len(ai_reply))
 
         if hasattr(response, 'usage_metadata'):
             context['input_tokens'] += response.usage_metadata.prompt_token_count
             context['output_tokens'] += response.usage_metadata.candidates_token_count
-    except Exception:
+            debug_event(
+                "gemini_tokens",
+                call_sid=call_sid,
+                prompt_tokens=response.usage_metadata.prompt_token_count,
+                output_tokens=response.usage_metadata.candidates_token_count,
+                input_total=context.get("input_tokens"),
+                output_total=context.get("output_tokens"),
+            )
+    except Exception as e:
+        debug_exception("gemini_error", call_sid=call_sid, err=e)
         # Deterministic fallback if AI fails
         if not context.get("problem"):
             ai_reply = "How may I help you?"
