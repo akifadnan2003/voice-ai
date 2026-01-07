@@ -97,11 +97,16 @@ def is_likely_non_english(text: str) -> bool:
         return True
 
     words = re.findall(r"[a-z']+", text.lower())
+    marker_hits = sum(1 for w in words if w in _NON_ENGLISH_MARKERS)
+    # If we recognize common foreign-language marker words, enforce English even for short utterances.
+    if marker_hits >= 1:
+        return True
+
+    # Otherwise avoid false positives on very short English utterances (e.g., "yes", "no").
     if len(words) < 3:
         return False
 
-    marker_hits = sum(1 for w in words if w in _NON_ENGLISH_MARKERS)
-    return marker_hits >= 2
+    return False
 
 
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -346,21 +351,24 @@ def voice():
             mimetype='text/xml'
         )
 
-    # English-only enforcement: warn once, then hang up.
+    # English-only enforcement: warn once, then close the call if the caller continues in a foreign language.
     if is_likely_non_english(user_input):
         context["english_warning_count"] = int(context.get("english_warning_count", 0)) + 1
         if context["english_warning_count"] >= 2:
-            msg = "Proceed in English."
+            msg = "This call can only be processed in English. Please try again later."
             context["history"].append(f"AI: {msg}")
             del call_context[call_sid]
             return Response(f"<Response><Say>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
 
-        msg = "Proceed in English."
+        msg = "Please speak in English."
         context["history"].append(f"AI: {msg}")
         return Response(
             f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say>{msg}</Say></Gather></Response>",
             mimetype='text/xml'
         )
+    else:
+        # Reset after an English utterance so an early warning doesn't cause a later accidental hangup.
+        context["english_warning_count"] = 0
 
     # Track transcript
     context["history"].append(f"User: {user_input}")
