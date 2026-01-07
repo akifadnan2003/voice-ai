@@ -3,6 +3,7 @@ import time
 import requests
 import base64
 import re
+import math
 from flask import Flask, request, Response
 import google.generativeai as genai
 
@@ -16,7 +17,12 @@ ZD_SUBDOMAIN = os.environ.get("ZD_SUBDOMAIN")
 ZD_TOKEN = os.environ.get("ZD_TOKEN")
 
 # Pricing
-PRICE_TWILIO_PER_MIN = 0.014
+# Twilio Voice is typically billed per-minute (rounded up). Speech Recognition (STT) may be billed
+# separately per-minute as well. Defaults are set to match an observed ~$0.0433 for a ~31s call:
+# 1 billed minute * (0.014 voice + 0.0293 STT) = 0.0433
+PRICE_TWILIO_VOICE_PER_MIN = float(os.environ.get("TWILIO_VOICE_PER_MIN", "0.014"))
+PRICE_TWILIO_STT_PER_MIN = float(os.environ.get("TWILIO_STT_PER_MIN", "0.0293"))
+
 PRICE_GEMINI_INPUT_1K = 0.000075
 PRICE_GEMINI_OUTPUT_1K = 0.00030
 
@@ -273,8 +279,8 @@ def normalize_problem_text(text: str) -> str:
     return normalized
 
 def calculate_cost(duration_sec, in_tok, out_tok):
-    minutes = (duration_sec // 60) + 1
-    twilio_cost = minutes * PRICE_TWILIO_PER_MIN
+    billable_minutes = max(1, int(math.ceil(float(duration_sec) / 60.0)))
+    twilio_cost = billable_minutes * (PRICE_TWILIO_VOICE_PER_MIN + PRICE_TWILIO_STT_PER_MIN)
     ai_cost = (in_tok / 1000 * PRICE_GEMINI_INPUT_1K) + (out_tok / 1000 * PRICE_GEMINI_OUTPUT_1K)
     return round(twilio_cost + ai_cost, 4)
 
