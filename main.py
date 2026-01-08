@@ -5,7 +5,6 @@ import base64
 import re
 import math
 import traceback
-import threading
 from flask import Flask, request, Response
 import google.generativeai as genai
 
@@ -36,7 +35,6 @@ else:
     print("⚠️ WARNING: GEMINI_API_KEY is missing!")
 
 call_context = {}
-call_context_lock = threading.RLock()
 
 # Debug toggle
 DEBUG_CALL_FLOW = os.environ.get("DEBUG_CALL_FLOW", "").strip().lower() in {"1", "true", "yes"}
@@ -210,6 +208,40 @@ def normalize_problem_text(text: str) -> str:
     normalized = re.sub(r"\bcompress\s+or\b", "compressor", normalized, flags=re.IGNORECASE)
     normalized = re.sub(r"\bshock\s+absorber\b", "shock absorber", normalized, flags=re.IGNORECASE)
     normalized = re.sub(r"\br\s*m\s*a\b", "RMA", normalized, flags=re.IGNORECASE)
+
+    # Domain-aware speech-to-text correction:
+    # Twilio/Gather sometimes hears "car" as "card".
+    # Only correct it when the utterance is clearly about suspension/leaks, not payments.
+    lowered = normalized.lower()
+    if re.search(r"\bcard\b", lowered):
+        suspension_cues = (
+            "suspension",
+            "air suspension",
+            "strut",
+            "shock",
+            "compressor",
+            "leak",
+            "leaking",
+            "air bag",
+            "airbag",
+        )
+        payment_cues = (
+            "payment",
+            "paid",
+            "charge",
+            "charged",
+            "credit",
+            "debit",
+            "visa",
+            "mastercard",
+            "cvv",
+            "expiry",
+            "expiration",
+            "card number",
+        )
+        if any(cue in lowered for cue in suspension_cues) and not any(cue in lowered for cue in payment_cues):
+            normalized = re.sub(r"\bcard\b", "car", normalized, flags=re.IGNORECASE)
+
     return normalized
 
 def calculate_cost(duration_sec, in_tok, out_tok):
@@ -258,38 +290,36 @@ def voice():
         return Response("Missing CallSid", status=400, mimetype='text/plain')
     
     # 1. INITIALIZE CONTEXT
-    with call_context_lock:
-        if call_sid not in call_context:
-            call_context[call_sid] = {
-                "history": [],
-                "problem": "",
-                "email": "",
-                "email_confirmed": False,
-                "awaiting_email_confirmation": False,
-                "awaiting_email": False,
-                "email_declined": False,
-                "email_confirm_attempts": 0,
-                "email_request_attempts": 0,
-                "english_warning_count": 0,
-                "start_time": time.time(),
-                "input_tokens": 0,
-                "output_tokens": 0,
-            }
-            return Response(
-                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>Welcome to Aerosus customer support. How may I help you?</Say></Gather></Response>",
-                mimetype='text/xml'
-            )
+    if call_sid not in call_context:
+        call_context[call_sid] = {
+            "history": [],
+            "problem": "",
+            "email": "",
+            "email_confirmed": False,
+            "awaiting_email_confirmation": False,
+            "awaiting_email": False,
+            "email_declined": False,
+            "email_confirm_attempts": 0,
+            "email_request_attempts": 0,
+            "english_warning_count": 0,
+            "start_time": time.time(),
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+        return Response(
+            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>Welcome to Aerosus customer support. How may I help you?</Say></Gather></Response>",
+            mimetype='text/xml'
+        )
 
-        context = call_context[call_sid]
+    context = call_context[call_sid]
 
     # 2. NO INPUT HANDLING
     if not user_input:
         if context.get("problem") and not context.get("email"):
             if context.get("email_declined"):
                 msg = "Ok. I can't create a support ticket without an email. Goodbye."
-                context["history"].append(f"AI: {msg}")
-                with call_context_lock:
-                    call_context.pop(call_sid, None)
+                context.setdefault("history", []).append(f"AI: {msg}")
+                call_context.pop(call_sid, None)
                 return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
 
             attempts = int(context.get("email_request_attempts", 0))
@@ -315,8 +345,7 @@ def voice():
         # STRIKE 2
         if context["english_warning_count"] >= 2:
             msg = "This call can only be processed in English. Please try again later."
-            with call_context_lock:
-                call_context.pop(call_sid, None)
+            call_context.pop(call_sid, None)
             return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
         
         # STRIKE 1
@@ -333,8 +362,8 @@ def voice():
     # 4. TRANSCRIPT LOGGING
     context.setdefault("history", []).append(f"User: {user_input}")
 
-    # 4.5 HANDLE 'NO' DURING EMAIL REQUEST (stable terminal state)
-    # If we've asked for an email and the user declines, don't loop or mutate the problem.
+    # 4.5 STABLE EMAIL REQUEST HANDLING
+    # If we're waiting for an email and the user declines, exit cleanly (no loops/crashes).
     if context.get("awaiting_email") and not context.get("email"):
         extracted_email_now = extract_email_from_utterance(user_input)
         if extracted_email_now:
@@ -357,11 +386,9 @@ def voice():
             context["awaiting_email"] = False
             msg = "Ok. I can't create a support ticket without an email. Goodbye."
             context["history"].append(f"AI: {msg}")
-            with call_context_lock:
-                call_context.pop(call_sid, None)
+            call_context.pop(call_sid, None)
             return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
 
-        # User said something else (not an email). Ask again, deterministically.
         attempts = int(context.get("email_request_attempts", 0))
         ai_reply = "Please say your email one character at a time." if attempts >= 2 else "Ok to proceed with your request provide me your email."
         context["email_request_attempts"] = attempts + 1
@@ -444,8 +471,7 @@ def voice():
         if context.get("email_declined"):
             msg = "Ok. I can't create a support ticket without an email. Goodbye."
             context["history"].append(f"AI: {msg}")
-            with call_context_lock:
-                call_context.pop(call_sid, None)
+            call_context.pop(call_sid, None)
             return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
 
         attempts = int(context.get("email_request_attempts", 0))
@@ -468,8 +494,7 @@ def voice():
         ticket_id = create_zendesk_ticket(context["email"], f"{issue_text}\n\nTranscript:\n{transcript}", total_cost)
 
         msg = "Ok ticket created. Closing the call." if ticket_id else "I could not create the ticket right now. Closing the call."
-        with call_context_lock:
-            call_context.pop(call_sid, None)
+        call_context.pop(call_sid, None)
         return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
 
     # 10. GEMINI BRAIN (With Double Defense & Smart Email Extraction)
@@ -522,8 +547,7 @@ OUTPUT RULES:
             context["english_warning_count"] = int(context.get("english_warning_count", 0)) + 1
             if context["english_warning_count"] >= 2:
                 msg = "This call can only be processed in English. Please try again later."
-                with call_context_lock:
-                    call_context.pop(call_sid, None)
+                call_context.pop(call_sid, None)
                 return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
             
             msg = "Please speak in English."
