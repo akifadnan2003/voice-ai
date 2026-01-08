@@ -8,6 +8,11 @@ import traceback
 from flask import Flask, request, Response
 import google.generativeai as genai
 
+try:
+    from langdetect import detect_langs
+except Exception:  # pragma: no cover
+    detect_langs = None
+
 # --- CONFIGURATION ---
 app = Flask(__name__)
 
@@ -110,7 +115,17 @@ _NON_ENGLISH_MARKERS = {
     "hola", "gracias", "bonjour", "merci", "salut", "hallo", "danke", "bitte", 
     "ciao", "grazie", "ola", "obrigado", "pedido", "envio", "reembolso", 
     "devolucion", "commande", "livraison", "remboursement", "bestellung", 
-    "lieferung", "rueckerstattung"
+    "lieferung", "rueckerstattung",
+
+    # Roman Urdu / Urdu (Latin transliteration)
+    # Twilio STT often outputs Urdu speech in Latin characters; add common function words.
+    "mujhe", "mujhay", "mera", "meri", "mere", "aap", "ap", "tum", "hum",
+    "kya", "ky", "kyun", "kaise", "kis", "kahan", "kab",
+    "hai", "hain", "tha", "thi",
+    "nahi", "nahin", "haan", "han",
+    "shukriya", "meherbani", "mehrbani",
+    "salam", "assalam", "walaikum", "waalaikum", "salaam",
+    "inshaallah", "mashallah",
 }
 
 def is_likely_non_english(text: str) -> bool:
@@ -121,6 +136,24 @@ def is_likely_non_english(text: str) -> bool:
         return False
     if re.fullmatch(r"[\s0-9+\-#()]+", text.strip() or ""):
         return False
+
+    # Language-ID (covers any language, including romanized text)
+    # Keep conservative thresholds to avoid false positives on short inputs.
+    if detect_langs is not None:
+        sample = (text or "").strip()
+        if len(sample) >= 12:
+            try:
+                langs = detect_langs(sample)
+                if langs:
+                    top = langs[0]
+                    top_lang = getattr(top, "lang", "")
+                    top_prob = float(getattr(top, "prob", 0.0) or 0.0)
+                    # If confidently not English, flag it.
+                    if top_lang and top_lang != "en" and top_prob >= 0.80:
+                        return True
+            except Exception:
+                # Fall back to heuristics below
+                pass
     # Strong signal: Non-Latin scripts
     if _NON_LATIN_SCRIPT_RE.search(text):
         return True

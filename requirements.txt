@@ -2,3 +2,4 @@ flask
 gunicorn
 requests
 google-generativeai
+langdetect
