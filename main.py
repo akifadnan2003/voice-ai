@@ -111,11 +111,21 @@ _NON_ENGLISH_MARKERS = {
     # Turkish
     "merhaba", "selam", "evet", "hayir", "yok", "lutfen", "tesekkur", "anlamadim", 
     "turkce", "biliyormusun", "siparis", "kargo", "fatura", "iade",
+
+    # Turkish (common grammar words / short utterances)
+    "bir", "ve", "bu", "da", "de", "icin", "cok", "ama", "nasil", "ne", "ben", "sen",
+
+    # German (common function words)
+    "hallo", "danke", "bitte", "nein", "ja", "ich", "ist", "und", "der", "die", "das", "nicht", "es",
+
     # European
     "hola", "gracias", "bonjour", "merci", "salut", "hallo", "danke", "bitte", 
     "ciao", "grazie", "ola", "obrigado", "pedido", "envio", "reembolso", 
     "devolucion", "commande", "livraison", "remboursement", "bestellung", 
     "lieferung", "rueckerstattung",
+
+    # Spanish/Italian/Portuguese (common function words)
+    "el", "la", "que", "de", "en", "y", "los", "del", "se", "por",
 
     # Roman Urdu / Urdu (Latin transliteration)
     # Twilio STT often outputs Urdu speech in Latin characters; add common function words.
@@ -321,87 +331,153 @@ def voice():
 
     if not call_sid:
         return Response("Missing CallSid", status=400, mimetype='text/plain')
-    
-    # 1. INITIALIZE CONTEXT
-    if call_sid not in call_context:
-        call_context[call_sid] = {
-            "history": [],
-            "problem": "",
-            "email": "",
-            "email_confirmed": False,
-            "awaiting_email_confirmation": False,
-            "awaiting_email": False,
-            "email_declined": False,
-            "email_confirm_attempts": 0,
-            "email_request_attempts": 0,
-            "english_warning_count": 0,
-            "start_time": time.time(),
-            "input_tokens": 0,
-            "output_tokens": 0,
-        }
-        return Response(
-            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>Welcome to Aerosus customer support. How may I help you?</Say></Gather></Response>",
-            mimetype='text/xml'
-        )
 
-    context = call_context[call_sid]
+    try:
+        # 1. INITIALIZE CONTEXT
+        if call_sid not in call_context:
+            call_context[call_sid] = {
+                "history": [],
+                "problem": "",
+                "email": "",
+                "email_confirmed": False,
+                "awaiting_email_confirmation": False,
+                "awaiting_email": False,
+                "email_declined": False,
+                "email_confirm_attempts": 0,
+                "email_request_attempts": 0,
+                "english_warning_count": 0,
+                "start_time": time.time(),
+                "input_tokens": 0,
+                "output_tokens": 0,
+            }
+            return Response(
+                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>Welcome to Aerosus customer support. How may I help you?</Say></Gather></Response>",
+                mimetype='text/xml'
+            )
 
-    # 2. NO INPUT HANDLING
-    if not user_input:
-        if context.get("problem") and not context.get("email"):
-            if context.get("email_declined"):
+        context = call_context[call_sid]
+
+        # 2. NO INPUT HANDLING
+        if not user_input:
+            if context.get("problem") and not context.get("email"):
+                if context.get("email_declined"):
+                    msg = "Ok. I can't create a support ticket without an email. Goodbye."
+                    context.setdefault("history", []).append(f"AI: {msg}")
+                    call_context.pop(call_sid, None)
+                    return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
+
+                attempts = int(context.get("email_request_attempts", 0))
+                prompt_text = "Please say your email one character at a time." if attempts >= 2 else "Ok to proceed with your request provide me your email."
+                context["email_request_attempts"] = attempts + 1
+                context["awaiting_email"] = True
+            else:
+                prompt_text = "I am listening. What is the problem?"
+
+            return Response(
+                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{prompt_text}</Say></Gather></Response>",
+                mimetype='text/xml'
+            )
+
+        # 3. LANGUAGE CHECK (Layer 1)
+        if is_likely_non_english(user_input):
+            context["english_warning_count"] = int(context.get("english_warning_count", 0)) + 1
+
+            if context["english_warning_count"] >= 2:
+                msg = "This call can only be processed in English. Please try again later."
+                call_context.pop(call_sid, None)
+                return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
+
+            msg = "Please speak in English."
+            context.setdefault("history", []).append(f"AI: {msg}")
+            return Response(
+                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{msg}</Say></Gather></Response>",
+                mimetype='text/xml'
+            )
+        else:
+            context["english_warning_count"] = 0
+
+        # 4. TRANSCRIPT LOGGING
+        context.setdefault("history", []).append(f"User: {user_input}")
+
+        # 4.5 STABLE EMAIL REQUEST HANDLING
+        if context.get("awaiting_email") and not context.get("email"):
+            extracted_email_now = extract_email_from_utterance(user_input)
+            if extracted_email_now:
+                context["awaiting_email"] = False
+                context["email"] = extracted_email_now
+                context["email_confirmed"] = False
+                context["awaiting_email_confirmation"] = True
+                context["email_request_attempts"] = 0
+
+                spelled = spell_email_address(context["email"])
+                ai_reply = f"I heard {spelled}. Is that correct?"
+                context["history"].append(f"AI: {ai_reply}")
+                return Response(
+                    f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                    mimetype='text/xml'
+                )
+
+            if is_negative(user_input):
+                context["email_declined"] = True
+                context["awaiting_email"] = False
                 msg = "Ok. I can't create a support ticket without an email. Goodbye."
-                context.setdefault("history", []).append(f"AI: {msg}")
+                context["history"].append(f"AI: {msg}")
                 call_context.pop(call_sid, None)
                 return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
 
             attempts = int(context.get("email_request_attempts", 0))
-            if attempts >= 2:
-                prompt_text = "Please say your email one character at a time."
-            else:
-                prompt_text = "Ok to proceed with your request provide me your email."
+            ai_reply = "Please say your email one character at a time." if attempts >= 2 else "Ok to proceed with your request provide me your email."
             context["email_request_attempts"] = attempts + 1
-            context["awaiting_email"] = True
-        else:
-            prompt_text = "I am listening. What is the problem?"
-        
-        return Response(
-            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{prompt_text}</Say></Gather></Response>",
-            mimetype='text/xml'
-        )
+            context["history"].append(f"AI: {ai_reply}")
+            return Response(
+                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                mimetype='text/xml'
+            )
 
-    # 3. LANGUAGE CHECK (LAYER 1 - REGEX)
-    # Check if the user is clearly speaking a foreign language
-    if is_likely_non_english(user_input):
-        context["english_warning_count"] = int(context.get("english_warning_count", 0)) + 1
-        
-        # STRIKE 2
-        if context["english_warning_count"] >= 2:
-            msg = "This call can only be processed in English. Please try again later."
-            call_context.pop(call_sid, None)
-            return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
-        
-        # STRIKE 1
-        msg = "Please speak in English."
-        context["history"].append(f"AI: {msg}")
-        return Response(
-            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{msg}</Say></Gather></Response>",
-            mimetype='text/xml'
-        )
-    else:
-        # Reset counter on valid English input to avoid false flags accumulating
-        context["english_warning_count"] = 0
+        # 5. EMAIL CONFIRMATION FLOW
+        if context.get("email") and not context.get("email_confirmed"):
+            extracted_email = extract_email_from_utterance(user_input)
+            if extracted_email:
+                context["email"] = extracted_email
+                context["email_confirmed"] = False
+                context["awaiting_email_confirmation"] = True
+                context["email_confirm_attempts"] = 0
 
-    # 4. TRANSCRIPT LOGGING
-    context.setdefault("history", []).append(f"User: {user_input}")
+                spelled = spell_email_address(context["email"])
+                ai_reply = f"I heard {spelled}. Is that correct?"
+                context["history"].append(f"AI: {ai_reply}")
+                return Response(
+                    f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                    mimetype='text/xml'
+                )
 
-    # 4.5 STABLE EMAIL REQUEST HANDLING
-    # If we're waiting for an email and the user declines, exit cleanly (no loops/crashes).
-    if context.get("awaiting_email") and not context.get("email"):
-        extracted_email_now = extract_email_from_utterance(user_input)
-        if extracted_email_now:
-            context["awaiting_email"] = False
-            context["email"] = extracted_email_now
+            if context.get("awaiting_email_confirmation") and is_affirmative(user_input):
+                context["email_confirmed"] = True
+                context["awaiting_email_confirmation"] = False
+            elif context.get("awaiting_email_confirmation") and is_negative(user_input):
+                context["email"] = ""
+                context["email_confirmed"] = False
+                context["awaiting_email_confirmation"] = False
+                context["awaiting_email"] = True
+                ai_reply = "Ok to proceed with your request provide me your email."
+                context["history"].append(f"AI: {ai_reply}")
+                return Response(
+                    f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                    mimetype='text/xml'
+                )
+            else:
+                spelled = spell_email_address(context.get("email", ""))
+                ai_reply = f"I heard {spelled}. Is that correct?"
+                context["history"].append(f"AI: {ai_reply}")
+                return Response(
+                    f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                    mimetype='text/xml'
+                )
+
+        # 6. LEGACY REGEX EMAIL EXTRACTION (Backup)
+        extracted_email = extract_email_from_utterance(user_input)
+        if not context.get("email") and extracted_email:
+            context["email"] = extracted_email
             context["email_confirmed"] = False
             context["awaiting_email_confirmation"] = True
             context["email_request_attempts"] = 0
@@ -414,124 +490,48 @@ def voice():
                 mimetype='text/xml'
             )
 
-        if is_negative(user_input):
-            context["email_declined"] = True
-            context["awaiting_email"] = False
-            msg = "Ok. I can't create a support ticket without an email. Goodbye."
-            context["history"].append(f"AI: {msg}")
-            call_context.pop(call_sid, None)
-            return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
+        # 7. PROBLEM CAPTURE
+        if not context.get("email") and not extracted_email:
+            if not context.get("problem"):
+                context["problem"] = normalize_problem_text(user_input.strip())
+            else:
+                extra = normalize_problem_text(user_input.strip())
+                if extra and extra.lower() not in context["problem"].lower():
+                    context["problem"] = f"{context['problem']} {extra}".strip()
 
-        attempts = int(context.get("email_request_attempts", 0))
-        ai_reply = "Please say your email one character at a time." if attempts >= 2 else "Ok to proceed with your request provide me your email."
-        context["email_request_attempts"] = attempts + 1
-        context["history"].append(f"AI: {ai_reply}")
-        return Response(
-            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
-            mimetype='text/xml'
-        )
+        # 8. HARD STOP: NAGGING FOR EMAIL
+        if context.get("problem") and not context.get("email"):
+            if context.get("email_declined"):
+                msg = "Ok. I can't create a support ticket without an email. Goodbye."
+                context["history"].append(f"AI: {msg}")
+                call_context.pop(call_sid, None)
+                return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
 
-    # 5. EMAIL CONFIRMATION FLOW (If we already captured an email)
-    if context.get("email") and not context.get("email_confirmed"):
-        # Check if user is confirming or replacing
-        extracted_email = extract_email_from_utterance(user_input)
-        if extracted_email:
-            context["email"] = extracted_email
-            context["email_confirmed"] = False
-            context["awaiting_email_confirmation"] = True
-            context["email_confirm_attempts"] = 0
-            
-            spelled = spell_email_address(context["email"])
-            ai_reply = f"I heard {spelled}. Is that correct?"
-            context["history"].append(f"AI: {ai_reply}")
-            return Response(
-                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
-                mimetype='text/xml'
-            )
-
-        if context.get("awaiting_email_confirmation") and is_affirmative(user_input):
-            context["email_confirmed"] = True
-            context["awaiting_email_confirmation"] = False
-        elif context.get("awaiting_email_confirmation") and is_negative(user_input):
-            context["email"] = ""
-            context["email_confirmed"] = False
-            context["awaiting_email_confirmation"] = False
+            attempts = int(context.get("email_request_attempts", 0))
+            ai_reply = "Please say your email one character at a time." if attempts >= 2 else "Ok to proceed with your request provide me your email."
+            context["email_request_attempts"] = attempts + 1
             context["awaiting_email"] = True
-            ai_reply = "Ok to proceed with your request provide me your email."
-            context["history"].append(f"AI: {ai_reply}")
-            return Response(
-                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
-                mimetype='text/xml'
-            )
-        else:
-            # Ambiguous response -> Re-verify
-            spelled = spell_email_address(context.get("email", ""))
-            ai_reply = f"I heard {spelled}. Is that correct?"
             context["history"].append(f"AI: {ai_reply}")
             return Response(
                 f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
                 mimetype='text/xml'
             )
 
-    # 6. LEGACY REGEX EMAIL EXTRACTION (Backup)
-    extracted_email = extract_email_from_utterance(user_input)
-    if not context.get("email") and extracted_email:
-        context["email"] = extracted_email
-        context["email_confirmed"] = False
-        context["awaiting_email_confirmation"] = True
-        context["email_request_attempts"] = 0 # Reset nagging
-        
-        spelled = spell_email_address(context["email"])
-        ai_reply = f"I heard {spelled}. Is that correct?"
-        context["history"].append(f"AI: {ai_reply}")
-        return Response(
-            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
-            mimetype='text/xml'
-        )
+        # 9. TICKET CREATION CHECK
+        if context.get("problem") and context.get("email") and context.get("email_confirmed"):
+            duration = time.time() - context["start_time"]
+            total_cost = calculate_cost(duration, context.get("input_tokens", 0), context.get("output_tokens", 0))
 
-    # 7. PROBLEM CAPTURE
-    if not context.get("email") and not extracted_email:
-        if not context.get("problem"):
-            context["problem"] = normalize_problem_text(user_input.strip())
-        else:
-            extra = normalize_problem_text(user_input.strip())
-            if extra and extra.lower() not in context["problem"].lower():
-                context["problem"] = f"{context['problem']} {extra}".strip()
+            transcript = "\n".join(context.get("history", []))
+            issue_text = context.get("problem", "")
+            ticket_id = create_zendesk_ticket(context["email"], f"{issue_text}\n\nTranscript:\n{transcript}", total_cost)
 
-    # 8. HARD STOP: NAGGING FOR EMAIL
-    # If we have the problem but no email, we force the flow to ask for email.
-    if context.get("problem") and not context.get("email"):
-        if context.get("email_declined"):
-            msg = "Ok. I can't create a support ticket without an email. Goodbye."
-            context["history"].append(f"AI: {msg}")
+            msg = "Ok ticket created. Closing the call." if ticket_id else "I could not create the ticket right now. Closing the call."
             call_context.pop(call_sid, None)
             return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
 
-        attempts = int(context.get("email_request_attempts", 0))
-        ai_reply = "Please say your email one character at a time." if attempts >= 2 else "Ok to proceed with your request provide me your email."
-        context["email_request_attempts"] = attempts + 1
-        context["awaiting_email"] = True
-        context["history"].append(f"AI: {ai_reply}")
-        return Response(
-            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
-            mimetype='text/xml'
-        )
-
-    # 9. TICKET CREATION CHECK
-    if context.get("problem") and context.get("email") and context.get("email_confirmed"):
-        duration = time.time() - context["start_time"]
-        total_cost = calculate_cost(duration, context.get("input_tokens", 0), context.get("output_tokens", 0))
-
-        transcript = "\n".join(context.get("history", []))
-        issue_text = context.get("problem", "")
-        ticket_id = create_zendesk_ticket(context["email"], f"{issue_text}\n\nTranscript:\n{transcript}", total_cost)
-
-        msg = "Ok ticket created. Closing the call." if ticket_id else "I could not create the ticket right now. Closing the call."
-        call_context.pop(call_sid, None)
-        return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
-
-    # 10. GEMINI BRAIN (With Double Defense & Smart Email Extraction)
-    prompt = f"""
+        # 10. GEMINI BRAIN
+        prompt = f"""
 You are a helpful customer support agent for Aerosus.
 
 CRITICAL INSTRUCTION - LANGUAGE CHECK:
@@ -565,69 +565,71 @@ OUTPUT RULES:
 - Otherwise, keep your response to one short sentence.
 """
 
-    try:
-        response = model.generate_content(prompt)
-        ai_reply = response.text.strip()
-        
-        if hasattr(response, 'usage_metadata'):
-            context['input_tokens'] += response.usage_metadata.prompt_token_count
-            context['output_tokens'] += response.usage_metadata.candidates_token_count
+        try:
+            if model is None:
+                raise RuntimeError("Gemini model not configured")
+            response = model.generate_content(prompt)
+            ai_reply = response.text.strip()
 
-        # --- LOGIC: HANDLE GEMINI ACTIONS ---
+            if hasattr(response, 'usage_metadata'):
+                context['input_tokens'] += response.usage_metadata.prompt_token_count
+                context['output_tokens'] += response.usage_metadata.candidates_token_count
 
-        # 1. Foreign Language Flag (Layer 2)
-        if "ACTION_NON_ENGLISH" in ai_reply:
-            context["english_warning_count"] = int(context.get("english_warning_count", 0)) + 1
-            if context["english_warning_count"] >= 2:
-                msg = "This call can only be processed in English. Please try again later."
-                call_context.pop(call_sid, None)
-                return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
-            
-            msg = "Please speak in English."
-            context["history"].append(f"AI: {msg}")
-            return Response(
-                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{msg}</Say></Gather></Response>",
-                mimetype='text/xml'
-            )
+            if "ACTION_NON_ENGLISH" in ai_reply:
+                context["english_warning_count"] = int(context.get("english_warning_count", 0)) + 1
+                if context["english_warning_count"] >= 2:
+                    msg = "This call can only be processed in English. Please try again later."
+                    call_context.pop(call_sid, None)
+                    return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
 
-        # 2. Smart Email Extraction
-        if "ACTION_CAPTURE_EMAIL:" in ai_reply:
-            captured_email = ai_reply.split("ACTION_CAPTURE_EMAIL:", 1)[1].strip()
-            captured_email = captured_email.strip(".,;:!?") # Clean extraction
-            
-            # Store it
-            context["email"] = captured_email
-            context["email_confirmed"] = False
-            context["awaiting_email_confirmation"] = True
-            context["awaiting_email"] = False
-            context["email_request_attempts"] = 0
-            
-            spelled = spell_email_address(captured_email)
-            ai_reply = f"I heard {spelled}. Is that correct?"
-            context["history"].append(f"AI: {ai_reply}")
-            return Response(
-                f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
-                mimetype='text/xml'
-            )
+                msg = "Please speak in English."
+                context["history"].append(f"AI: {msg}")
+                return Response(
+                    f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{msg}</Say></Gather></Response>",
+                    mimetype='text/xml'
+                )
 
-        # 3. Handle Nagging Counter (If AI asked for email standardly)
-        if "provide me your email" in ai_reply.lower():
-             context["email_request_attempts"] = int(context.get("email_request_attempts", 0)) + 1
+            if "ACTION_CAPTURE_EMAIL:" in ai_reply:
+                captured_email = ai_reply.split("ACTION_CAPTURE_EMAIL:", 1)[1].strip().strip(".,;:!?")
+                context["email"] = captured_email
+                context["email_confirmed"] = False
+                context["awaiting_email_confirmation"] = True
+                context["awaiting_email"] = False
+                context["email_request_attempts"] = 0
+
+                spelled = spell_email_address(captured_email)
+                ai_reply = f"I heard {spelled}. Is that correct?"
+                context["history"].append(f"AI: {ai_reply}")
+                return Response(
+                    f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                    mimetype='text/xml'
+                )
+
+            if "provide me your email" in ai_reply.lower():
+                context["email_request_attempts"] = int(context.get("email_request_attempts", 0)) + 1
+
+        except Exception as e:
+            debug_exception("gemini_error", call_sid=call_sid, err=e)
+            if not context.get("problem"):
+                ai_reply = "How may I help you?"
+            elif not context.get("email"):
+                ai_reply = "Ok to proceed with your request provide me your email."
+            else:
+                ai_reply = "Could you repeat that, please?"
+
+        context["history"].append(f"AI: {ai_reply}")
+        return Response(
+            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+            mimetype='text/xml'
+        )
 
     except Exception as e:
-        debug_exception("gemini_error", call_sid=call_sid, err=e)
-        if not context.get("problem"):
-            ai_reply = "How may I help you?"
-        elif not context.get("email"):
-            ai_reply = "Ok to proceed with your request provide me your email."
-        else:
-            ai_reply = "Could you repeat that, please?"
-
-    context["history"].append(f"AI: {ai_reply}")
-    return Response(
-        f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
-        mimetype='text/xml'
-    )
+        debug_exception("voice_crash", call_sid=call_sid, err=e)
+        call_context.pop(call_sid, None)
+        return Response(
+            f"<Response><Say voice='{VOICE_NAME}'>System error. Please call back later.</Say><Hangup/></Response>",
+            mimetype='text/xml'
+        )
 
 if __name__ == "__main__":
     app.run(debug=True, port=8080)
