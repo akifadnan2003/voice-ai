@@ -221,36 +221,46 @@ def is_negative(text: str) -> bool:
     return bool(text) and bool(NEGATIVE_RE.search(text))
 
 def spell_email_address(email: str) -> str:
+    """Spell local part letter-by-letter with spaces, read domain normally."""
     if not email or "@" not in email: return ""
     local_part, domain = email.strip().lower().split("@", 1)
     token_map = {".": "dot", "_": "underscore", "-": "dash", "+": "plus"}
-    common_domains = {"gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "icloud.com"}
     
+    # Spell local part character by character with spaces
     spoken_local = []
     for ch in local_part:
-        if ch.isalnum(): spoken_local.append(ch)
-        elif ch in token_map: spoken_local.append(token_map[ch])
+        if ch.isalnum():
+            spoken_local.append(ch)
+        elif ch in token_map:
+            spoken_local.append(token_map[ch])
     
-    if domain in common_domains:
-        spoken_domain = domain
-    else:
-        spoken_domain_tokens = []
-        for ch in domain:
-            if ch.isalnum(): spoken_domain_tokens.append(ch)
-            elif ch in token_map: spoken_domain_tokens.append(token_map[ch])
-        spoken_domain = " ".join(spoken_domain_tokens)
-        
-    return f"{' '.join(spoken_local)} at {spoken_domain}".strip()
+    # Read domain normally (e.g., "gmail.com" not "g m a i l dot c o m")
+    return f"{' '.join(spoken_local)} at {domain}".strip()
 
 def normalize_problem_text(text: str) -> str:
+    """Fix common speech-to-text errors for air suspension domain."""
     if not text: return ""
     normalized = text
+    
+    # Common STT mishearings for air suspension terminology
     normalized = re.sub(r"\bear\s+suspension\b", "air suspension", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\beir\s+suspension\b", "air suspension", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bhere\s+suspension\b", "air suspension", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bhair\s+suspension\b", "air suspension", normalized, flags=re.IGNORECASE)
     normalized = re.sub(r"\bair\s+suspensions\b", "air suspension", normalized, flags=re.IGNORECASE)
     normalized = re.sub(r"\baero\s+sus\b", "Aerosus", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\baero\s+sauce\b", "Aerosus", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\baero\s+source\b", "Aerosus", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bair\s+o\s+sus\b", "Aerosus", normalized, flags=re.IGNORECASE)
     normalized = re.sub(r"\bcompress\s+or\b", "compressor", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bcompress\s+her\b", "compressor", normalized, flags=re.IGNORECASE)
     normalized = re.sub(r"\bshock\s+absorber\b", "shock absorber", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bshock\s+observer\b", "shock absorber", normalized, flags=re.IGNORECASE)
     normalized = re.sub(r"\br\s*m\s*a\b", "RMA", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bstreet\b", "strut", normalized, flags=re.IGNORECASE)  # common mishearing
+    normalized = re.sub(r"\bstruck\b", "strut", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bleaking\b", "leaking", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bleaking\b", "leaking", normalized, flags=re.IGNORECASE)
 
     # Domain-aware speech-to-text correction:
     # Twilio/Gather sometimes hears "car" as "card".
@@ -321,6 +331,70 @@ def create_zendesk_ticket(user_email, issue_summary, cost):
     except Exception as e:
         print(f"💥 Zendesk request crashed: {e}")
         return None
+
+
+def intelligently_normalize_problem(raw_problem: str, context_dict: dict) -> str:
+    """
+    Use Gemini to intelligently rewrite the problem for Zendesk.
+    Fixes transcription errors based on air suspension domain context.
+    """
+    if not raw_problem:
+        return raw_problem
+    
+    # First apply regex-based fixes
+    normalized = normalize_problem_text(raw_problem)
+    
+    # Then use Gemini for deeper context understanding
+    if model is None:
+        return normalized
+    
+    try:
+        prompt = f"""
+You are a text normalizer for Aerosus, an air suspension parts company.
+
+Your job is to fix speech-to-text transcription errors in customer problem descriptions.
+The customer called about their car's air suspension system.
+
+COMMON TRANSCRIPTION ERRORS TO FIX:
+- "ear suspension" → "air suspension"
+- "hair suspension" → "air suspension"
+- "here suspension" → "air suspension"
+- "aero sus" / "aero sauce" / "air o sus" → "Aerosus"
+- "compress or" / "compress her" → "compressor"
+- "street" / "struck" (when talking about car parts) → "strut"
+- "shock observer" → "shock absorber"
+- "card" (when talking about vehicle, not payment) → "car"
+- Any other obvious speech-to-text errors in the automotive/suspension context
+
+COMMON AEROSUS ISSUES:
+{TICKET_TYPE_GUIDE}
+
+INPUT TEXT:
+"{normalized}"
+
+OUTPUT RULES:
+- Return ONLY the corrected text, nothing else
+- Keep the same meaning, just fix obvious transcription errors
+- If no corrections needed, return the text unchanged
+- Do NOT add explanations or commentary
+- Keep it concise and professional
+"""
+        response = model.generate_content(prompt)
+        result = response.text.strip()
+        
+        # Track token usage if available
+        if hasattr(response, 'usage_metadata') and context_dict:
+            context_dict['input_tokens'] = context_dict.get('input_tokens', 0) + response.usage_metadata.prompt_token_count
+            context_dict['output_tokens'] = context_dict.get('output_tokens', 0) + response.usage_metadata.candidates_token_count
+        
+        # Sanity check: result should be similar length (not a full paragraph explanation)
+        if result and len(result) < len(normalized) * 3:
+            return result
+        return normalized
+        
+    except Exception as e:
+        print(f"⚠️ Gemini normalization failed: {e}")
+        return normalized
 
 # --- MAIN ROUTE ---
 @app.route("/voice", methods=['GET', 'POST'])
@@ -418,12 +492,16 @@ def voice():
                 )
 
             if is_negative(user_input):
-                context["email_declined"] = True
-                context["awaiting_email"] = False
-                msg = "Ok. I can't create a support ticket without an email. Goodbye."
-                context["history"].append(f"AI: {msg}")
-                call_context.pop(call_sid, None)
-                return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
+                # User said something negative but we're waiting for email input, not declining
+                # Just re-ask for email
+                attempts = int(context.get("email_request_attempts", 0))
+                ai_reply = "Please say your email one character at a time." if attempts >= 2 else "Please provide your email."
+                context["email_request_attempts"] = attempts + 1
+                context["history"].append(f"AI: {ai_reply}")
+                return Response(
+                    f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                    mimetype='text/xml'
+                )
 
             attempts = int(context.get("email_request_attempts", 0))
             ai_reply = "Please say your email one character at a time." if attempts >= 2 else "Ok to proceed with your request provide me your email."
@@ -455,11 +533,23 @@ def voice():
                 context["email_confirmed"] = True
                 context["awaiting_email_confirmation"] = False
             elif context.get("awaiting_email_confirmation") and is_negative(user_input):
+                # Track how many times user said "No" to email confirmation
+                confirm_attempts = int(context.get("email_confirm_attempts", 0)) + 1
+                context["email_confirm_attempts"] = confirm_attempts
+                
+                if confirm_attempts >= 2:
+                    # Give up after 2 "No" responses
+                    msg = "I am having a problem hearing you, please call later."
+                    context["history"].append(f"AI: {msg}")
+                    call_context.pop(call_sid, None)
+                    return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
+                
+                # Ask to repeat email
                 context["email"] = ""
                 context["email_confirmed"] = False
                 context["awaiting_email_confirmation"] = False
                 context["awaiting_email"] = True
-                ai_reply = "Ok to proceed with your request provide me your email."
+                ai_reply = "Please repeat your email."
                 context["history"].append(f"AI: {ai_reply}")
                 return Response(
                     f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
@@ -499,16 +589,16 @@ def voice():
                 if extra and extra.lower() not in context["problem"].lower():
                     context["problem"] = f"{context['problem']} {extra}".strip()
 
-        # 8. HARD STOP: NAGGING FOR EMAIL
+        # 8. ASK FOR EMAIL IF PROBLEM IS CAPTURED
         if context.get("problem") and not context.get("email"):
             if context.get("email_declined"):
-                msg = "Ok. I can't create a support ticket without an email. Goodbye."
+                msg = "I am having a problem hearing you, please call later."
                 context["history"].append(f"AI: {msg}")
                 call_context.pop(call_sid, None)
                 return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
 
             attempts = int(context.get("email_request_attempts", 0))
-            ai_reply = "Please say your email one character at a time." if attempts >= 2 else "Ok to proceed with your request provide me your email."
+            ai_reply = "Please say your email one character at a time." if attempts >= 2 else "To proceed with your request, please provide me your email."
             context["email_request_attempts"] = attempts + 1
             context["awaiting_email"] = True
             context["history"].append(f"AI: {ai_reply}")
@@ -522,11 +612,14 @@ def voice():
             duration = time.time() - context["start_time"]
             total_cost = calculate_cost(duration, context.get("input_tokens", 0), context.get("output_tokens", 0))
 
+            # Intelligently normalize the problem text using Gemini
+            raw_problem = context.get("problem", "")
+            cleaned_problem = intelligently_normalize_problem(raw_problem, context)
+            
             transcript = "\n".join(context.get("history", []))
-            issue_text = context.get("problem", "")
-            ticket_id = create_zendesk_ticket(context["email"], f"{issue_text}\n\nTranscript:\n{transcript}", total_cost)
+            ticket_id = create_zendesk_ticket(context["email"], f"{cleaned_problem}\n\nTranscript:\n{transcript}", total_cost)
 
-            msg = "Ok ticket created. Closing the call." if ticket_id else "I could not create the ticket right now. Closing the call."
+            msg = "Ticket created. Closing the call." if ticket_id else "I could not create the ticket right now. Closing the call."
             call_context.pop(call_sid, None)
             return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
 
@@ -544,8 +637,8 @@ CRITICAL INSTRUCTION - EMAIL CAPTURE:
    - If YES, output ONLY: ACTION_CAPTURE_EMAIL: [the_email_address]
    - Example: ACTION_CAPTURE_EMAIL: akif@gmail.com
 2. If NO email is found:
-   - If the user has NOT described the problem yet, ask a short question to get the problem.
-   - If the user HAS described the problem but has NOT provided an email, ask EXACTLY: "Ok to proceed with your request provide me your email."
+   - If the user says something vague like "there is a problem" or "I have an issue" without describing WHAT the problem is, ask EXACTLY: "Please describe the problem."
+   - If the user HAS described the specific problem but has NOT provided an email, ask EXACTLY: "To proceed with your request, please provide me your email."
 
 Context:
 - "ear suspension" = "air suspension".
