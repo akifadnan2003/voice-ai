@@ -355,6 +355,67 @@ def is_vague_problem(text: str) -> bool:
     return False
 
 
+def is_order_related(text: str) -> bool:
+    """
+    Check if the problem is order-related (return, order status, shipping status).
+    These require both order number AND email for verification.
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    order_keywords = (
+        "order status", "order number", "my order", "where is my order",
+        "shipping status", "shipping update", "delivery status", "track", "tracking",
+        "return", "refund", "rma", "send back", "exchange",
+        "cancel order", "cancel my order", "cancellation",
+        "when will", "hasn't arrived", "not arrived", "not received",
+    )
+    return any(kw in lowered for kw in order_keywords)
+
+
+def extract_order_number(text: str) -> str:
+    """
+    Extract order number from speech. Order numbers are typically numeric or alphanumeric.
+    """
+    if not text:
+        return ""
+    
+    # Common patterns: "order 12345", "order number 12345", "#12345", etc.
+    # Also handle spelled out: "one two three four five"
+    lowered = text.lower().strip()
+    
+    # Direct numeric extraction after "order" or "number"
+    match = re.search(r"(?:order|number|#)\s*[:#]?\s*([a-z0-9\-]+)", lowered)
+    if match:
+        candidate = match.group(1).strip()
+        if len(candidate) >= 3:  # Order numbers are usually at least 3 chars
+            return candidate.upper()
+    
+    # Try to find standalone alphanumeric that looks like an order number
+    # (5+ digits or alphanumeric combo)
+    match = re.search(r"\b([a-z]{0,3}[0-9]{4,}[a-z0-9]*)\b", lowered)
+    if match:
+        return match.group(1).upper()
+    
+    # Handle spelled out numbers
+    number_words = {
+        "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+        "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+        "oh": "0", "o": "0",
+    }
+    words = lowered.split()
+    digits = []
+    for w in words:
+        if w in number_words:
+            digits.append(number_words[w])
+        elif w.isdigit():
+            digits.append(w)
+    if len(digits) >= 4:
+        return "".join(digits)
+    
+    return ""
+
+
 def calculate_cost(duration_sec, in_tok, out_tok):
     billable_minutes = max(1, int(math.ceil(float(duration_sec) / 60.0)))
     twilio_cost = billable_minutes * (PRICE_TWILIO_VOICE_PER_MIN + PRICE_TWILIO_STT_PER_MIN)
@@ -478,6 +539,12 @@ def voice():
                 "email_declined": False,
                 "email_confirm_attempts": 0,
                 "email_request_attempts": 0,
+                "order_number": "",
+                "order_number_confirmed": False,
+                "awaiting_order_number": False,
+                "awaiting_order_confirmation": False,
+                "order_confirm_attempts": 0,
+                "is_order_related_issue": False,
                 "english_warning_count": 0,
                 "start_time": time.time(),
                 "input_tokens": 0,
@@ -623,6 +690,84 @@ def voice():
                     mimetype='text/xml'
                 )
 
+        # 5.5. ORDER NUMBER HANDLING (for order-related issues)
+        if context.get("is_order_related_issue"):
+            # Try to extract order number from current input
+            extracted_order = extract_order_number(user_input)
+            
+            if context.get("awaiting_order_number") and not context.get("order_number"):
+                if extracted_order:
+                    context["order_number"] = extracted_order
+                    context["awaiting_order_number"] = False
+                    context["awaiting_order_confirmation"] = True
+                    context["order_confirm_attempts"] = 0
+                    ai_reply = f"I heard order number {extracted_order}. Is that correct?"
+                    context["history"].append(f"AI: {ai_reply}")
+                    return Response(
+                        f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                        mimetype='text/xml'
+                    )
+                else:
+                    ai_reply = "Please tell me your order number."
+                    context["history"].append(f"AI: {ai_reply}")
+                    return Response(
+                        f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                        mimetype='text/xml'
+                    )
+            
+            if context.get("order_number") and not context.get("order_number_confirmed"):
+                if extracted_order and extracted_order != context.get("order_number"):
+                    # User provided a different order number
+                    context["order_number"] = extracted_order
+                    context["awaiting_order_confirmation"] = True
+                    context["order_confirm_attempts"] = 0
+                    ai_reply = f"I heard order number {extracted_order}. Is that correct?"
+                    context["history"].append(f"AI: {ai_reply}")
+                    return Response(
+                        f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                        mimetype='text/xml'
+                    )
+                
+                if context.get("awaiting_order_confirmation") and is_affirmative(user_input):
+                    context["order_number_confirmed"] = True
+                    context["awaiting_order_confirmation"] = False
+                    # Now ask for email if not already captured
+                    if not context.get("email"):
+                        context["awaiting_email"] = True
+                        ai_reply = "Great. Now please provide your email address."
+                        context["history"].append(f"AI: {ai_reply}")
+                        return Response(
+                            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                            mimetype='text/xml'
+                        )
+                elif context.get("awaiting_order_confirmation") and is_negative(user_input):
+                    confirm_attempts = int(context.get("order_confirm_attempts", 0)) + 1
+                    context["order_confirm_attempts"] = confirm_attempts
+                    
+                    if confirm_attempts >= 2:
+                        msg = "I am having a problem hearing you, please call later."
+                        context["history"].append(f"AI: {msg}")
+                        call_context.pop(call_sid, None)
+                        return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
+                    
+                    context["order_number"] = ""
+                    context["order_number_confirmed"] = False
+                    context["awaiting_order_confirmation"] = False
+                    context["awaiting_order_number"] = True
+                    ai_reply = "Please repeat your order number."
+                    context["history"].append(f"AI: {ai_reply}")
+                    return Response(
+                        f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                        mimetype='text/xml'
+                    )
+                elif context.get("awaiting_order_confirmation"):
+                    ai_reply = f"I heard order number {context.get('order_number')}. Is that correct?"
+                    context["history"].append(f"AI: {ai_reply}")
+                    return Response(
+                        f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                        mimetype='text/xml'
+                    )
+
         # 6. LEGACY REGEX EMAIL EXTRACTION (Backup)
         extracted_email = extract_email_from_utterance(user_input)
         if not context.get("email") and extracted_email:
@@ -656,6 +801,30 @@ def voice():
                 
                 context["problem"] = captured
                 context["awaiting_problem_details"] = False
+                
+                # Check if this is an order-related issue
+                if is_order_related(captured):
+                    context["is_order_related_issue"] = True
+                    # Check if order number was already mentioned
+                    extracted_order = extract_order_number(captured)
+                    if extracted_order:
+                        context["order_number"] = extracted_order
+                        context["awaiting_order_confirmation"] = True
+                        ai_reply = f"I heard order number {extracted_order}. Is that correct?"
+                        context["history"].append(f"AI: {ai_reply}")
+                        return Response(
+                            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                            mimetype='text/xml'
+                        )
+                    else:
+                        context["awaiting_order_number"] = True
+                        ai_reply = "Please provide your order number."
+                        context["history"].append(f"AI: {ai_reply}")
+                        return Response(
+                            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                            mimetype='text/xml'
+                        )
+                        
             elif context.get("awaiting_problem_details"):
                 # User is providing details after we asked
                 extra = normalize_problem_text(user_input.strip())
@@ -665,6 +834,28 @@ def voice():
                     else:
                         context["problem"] = extra
                 context["awaiting_problem_details"] = False
+                
+                # Check if the detailed problem is order-related
+                if is_order_related(context.get("problem", "")):
+                    context["is_order_related_issue"] = True
+                    extracted_order = extract_order_number(context.get("problem", ""))
+                    if extracted_order:
+                        context["order_number"] = extracted_order
+                        context["awaiting_order_confirmation"] = True
+                        ai_reply = f"I heard order number {extracted_order}. Is that correct?"
+                        context["history"].append(f"AI: {ai_reply}")
+                        return Response(
+                            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                            mimetype='text/xml'
+                        )
+                    else:
+                        context["awaiting_order_number"] = True
+                        ai_reply = "Please provide your order number."
+                        context["history"].append(f"AI: {ai_reply}")
+                        return Response(
+                            f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                            mimetype='text/xml'
+                        )
             else:
                 extra = normalize_problem_text(user_input.strip())
                 if extra and extra.lower() not in context["problem"].lower():
@@ -672,6 +863,25 @@ def voice():
 
         # 8. ASK FOR EMAIL IF PROBLEM IS CAPTURED
         if context.get("problem") and not context.get("email"):
+            # For order-related issues, ensure order number is captured first
+            if context.get("is_order_related_issue"):
+                if not context.get("order_number"):
+                    context["awaiting_order_number"] = True
+                    ai_reply = "Please provide your order number."
+                    context["history"].append(f"AI: {ai_reply}")
+                    return Response(
+                        f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                        mimetype='text/xml'
+                    )
+                if not context.get("order_number_confirmed"):
+                    ai_reply = f"I heard order number {context.get('order_number')}. Is that correct?"
+                    context["awaiting_order_confirmation"] = True
+                    context["history"].append(f"AI: {ai_reply}")
+                    return Response(
+                        f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                        mimetype='text/xml'
+                    )
+            
             if context.get("email_declined"):
                 msg = "I am having a problem hearing you, please call later."
                 context["history"].append(f"AI: {msg}")
@@ -697,10 +907,18 @@ def voice():
             raw_problem = context.get("problem", "")
             cleaned_problem = intelligently_normalize_problem(raw_problem, context)
             
+            # Include order number in ticket if present
+            order_info = ""
+            if context.get("order_number"):
+                order_info = f"\n\nOrder Number: {context.get('order_number')}"
+            
             transcript = "\n".join(context.get("history", []))
-            ticket_id = create_zendesk_ticket(context["email"], f"{cleaned_problem}\n\nTranscript:\n{transcript}", total_cost)
+            ticket_id = create_zendesk_ticket(context["email"], f"{cleaned_problem}{order_info}\n\nTranscript:\n{transcript}", total_cost)
 
-            msg = "Ticket created. Closing the call." if ticket_id else "I could not create the ticket right now. Closing the call."
+            if ticket_id:
+                msg = "Thank you for calling Aerosus. Our team will look into your problem and get back to you as soon as possible. Have a nice day!"
+            else:
+                msg = "I could not create the ticket right now. Thank you for calling Aerosus. Please try again later. Have a nice day!"
             call_context.pop(call_sid, None)
             return Response(f"<Response><Say voice='{VOICE_NAME}'>{msg}</Say><Hangup/></Response>", mimetype='text/xml')
 
