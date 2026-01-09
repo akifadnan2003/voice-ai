@@ -297,6 +297,64 @@ def normalize_problem_text(text: str) -> str:
 
     return normalized
 
+
+def is_vague_problem(text: str) -> bool:
+    """
+    Check if the problem description is too vague and needs more details.
+    Returns True if the user just said something like "I have a problem" without specifics.
+    """
+    if not text:
+        return True
+    
+    lowered = text.lower().strip()
+    
+    # Specific automotive/suspension terms indicate a real problem description
+    specific_terms = (
+        "suspension", "air suspension", "compressor", "strut", "shock",
+        "leak", "leaking", "broken", "not working", "noise", "clicking",
+        "order", "tracking", "delivery", "refund", "return", "rma",
+        "invoice", "payment", "warranty", "damaged", "wrong", "missing",
+        "install", "compatibility", "fit", "replace", "pump", "valve",
+        "air bag", "airbag", "spring", "relay", "fuse", "sensor",
+        "height", "lowering", "raising", "stuck", "fault", "error",
+        "mercedes", "bmw", "audi", "porsche", "range rover", "land rover",
+        "volkswagen", "vw", "bentley", "rolls royce", "jaguar", "lexus",
+    )
+    
+    # If any specific term is present, it's not vague
+    if any(term in lowered for term in specific_terms):
+        return False
+    
+    # Vague phrases that need clarification
+    vague_patterns = (
+        r"\b(there('s|s| is)?\s+)?a\s+problem\b",
+        r"\bi\s+(have|got)\s+(a|an|some)?\s*(problem|issue)\b",
+        r"\bsomething('s|s| is)?\s+(wrong|broken)\b",
+        r"\bit('s|s| is)?\s+not\s+working\b",
+        r"\bneed\s+help\b",
+        r"\bhaving\s+(an?\s+)?(issue|problem|trouble)\b",
+    )
+    
+    for pattern in vague_patterns:
+        if re.search(pattern, lowered):
+            # Check if there's more substance beyond the vague phrase
+            # Remove the vague part and see if anything meaningful remains
+            remaining = re.sub(pattern, "", lowered).strip()
+            remaining = re.sub(r"\b(with|in|on|my|the|a|an|car|vehicle)\b", "", remaining).strip()
+            if len(remaining) < 5:  # Not much left = vague
+                return True
+    
+    # Very short descriptions are likely vague
+    words = [w for w in lowered.split() if len(w) > 2]
+    if len(words) <= 4:
+        # Check if it's just "problem with my car" type phrases
+        non_filler_words = [w for w in words if w not in ("the", "my", "car", "with", "have", "problem", "issue", "there", "help")]
+        if len(non_filler_words) == 0:
+            return True
+    
+    return False
+
+
 def calculate_cost(duration_sec, in_tok, out_tok):
     billable_minutes = max(1, int(math.ceil(float(duration_sec) / 60.0)))
     twilio_cost = billable_minutes * (PRICE_TWILIO_VOICE_PER_MIN + PRICE_TWILIO_STT_PER_MIN)
@@ -416,6 +474,7 @@ def voice():
                 "email_confirmed": False,
                 "awaiting_email_confirmation": False,
                 "awaiting_email": False,
+                "awaiting_problem_details": False,
                 "email_declined": False,
                 "email_confirm_attempts": 0,
                 "email_request_attempts": 0,
@@ -583,7 +642,29 @@ def voice():
         # 7. PROBLEM CAPTURE
         if not context.get("email") and not extracted_email:
             if not context.get("problem"):
-                context["problem"] = normalize_problem_text(user_input.strip())
+                captured = normalize_problem_text(user_input.strip())
+                
+                # Check if this is a vague problem that needs more details
+                if is_vague_problem(captured):
+                    context["awaiting_problem_details"] = True
+                    ai_reply = "Please describe the problem."
+                    context["history"].append(f"AI: {ai_reply}")
+                    return Response(
+                        f"<Response><Gather input='speech' language='en-US' timeout='5' speechTimeout='auto' hints='{SPEECH_HINTS}'><Say voice='{VOICE_NAME}'>{ai_reply}</Say></Gather></Response>",
+                        mimetype='text/xml'
+                    )
+                
+                context["problem"] = captured
+                context["awaiting_problem_details"] = False
+            elif context.get("awaiting_problem_details"):
+                # User is providing details after we asked
+                extra = normalize_problem_text(user_input.strip())
+                if extra:
+                    if context.get("problem"):
+                        context["problem"] = f"{context['problem']} {extra}".strip()
+                    else:
+                        context["problem"] = extra
+                context["awaiting_problem_details"] = False
             else:
                 extra = normalize_problem_text(user_input.strip())
                 if extra and extra.lower() not in context["problem"].lower():
